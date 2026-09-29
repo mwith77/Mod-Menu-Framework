@@ -1,0 +1,22 @@
+DefineMenuPage: [MOD MENU FRAMEWORK]
+ConfigurationFile: [mod_menu_framework.ini]
+Content:	{
+				{	ItemType: [Control]
+					ControlTitle: [Menu position]
+					Section: [settings]
+					SettingName: [menuPosition]
+					ControlType: [Slider]
+					SliderMinValue: [0]
+					SliderMaxValue: [13]
+					SliderStepSize: [1]
+					DefaultValue: [13]
+					MarkAsModified: [True]
+					ControlDependency: []
+					ControlDescription:	[
+											Which entry of the options list the Mod Configuration button is drawn after. Zero puts it above the first; thirteen puts it below the last.
+											
+											The page is built at startup, so a change here takes effect the next time the game is started.
+										]
+					PageIndex: [1]
+				}
+			}

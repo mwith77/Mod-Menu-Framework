@@ -1,0 +1,33 @@
+#include <winver.h>
+
+/* The version resource for the Mod Menu Framework. Bump the version here when
+   the framework is released. */
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    1,0,2,0
+ PRODUCTVERSION 1,0,2,0
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0x0L
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_DLL
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName",      "mwith77"
+            VALUE "FileDescription",  "Mod Menu Framework"
+            VALUE "FileVersion",      "v1.0.2"
+            VALUE "InternalName",     "mod_menu_framework"
+            VALUE "LegalCopyright",   "mwith77"
+            VALUE "OriginalFilename", "mod_menu_framework.dll"
+            VALUE "ProductName",      "Mod Menu Framework"
+            VALUE "ProductVersion",   "v1.0.2"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END

@@ -1,0 +1,271 @@
+DefineMenuPage: [EXAMPLE MOD]
+ConfigurationFile: [example_mod.ini]
+Content:	{
+				{	ItemType: [Control]
+					ControlTitle: [Example Toggle]
+					Section: [settings]
+					SettingName: [examplesetting1]
+					ControlType: [Toggle]
+					ToggleDisabledValue: ["OFF" = 0]
+					ToggleEnabledValue: ["ON" = 1]
+					DefaultValue: [0]
+					MarkAsModified: [True]
+					ControlDependency: []
+					ControlDescription:	[
+											This is an example description for a toggle that changes the value of examplesetting1 in example_mod.ini. 
+											This is the second line of the description.
+											
+											This is the fourth line of the description, the third line above this is empty. The description is contained within the square brackets starting on the empty line above and ending on the empty line below.
+										]
+				}
+				{	ItemType: [Control]
+					ControlTitle: [Example Slider]
+					Section: [settings]
+					SettingName: [examplesetting2]
+					ControlType: [Slider]
+					SliderMinValue: [-10.0]
+					SliderMaxValue: [10.0]
+					SliderStepSize: [1.0]
+					DefaultValue: [0]
+					MarkAsModified: [True]
+					ControlDependency: [examplesetting1 = 1]
+					ControlDependencyDescription:	[
+														To modify this setting, set <b>Example Toggle</b> to <b>ON</b>.
+													]
+					ControlDescription:	[
+											This is an example description for a slider that changes the value of examplesetting2 in example_mod.ini. 
+											The slider is bound between -10 and +10, in steps of 1 and default value of 0.
+											When The value of this control is changed from the default value, a bullet point appears next to the title.
+											This slider can only be changed if the example toggle is set to ON. Settings listed as dependencies are assumed to reside in the same section as the control that requires them, unless otherwise specified.
+										]
+				}
+				{	ItemType: [Control]
+					ControlTitle: [Example Selector 1]
+					Section: [settings]
+					SettingName: [examplesetting3]
+					ControlType: [Selector]
+					SelectorValues: ["Option 1" = 1, "Option 2" = 2, "Option 3" = 3, "Option 4" = 4]
+					DefaultValue: [1]
+					MarkAsModified: [True]
+					ControlDependency: [(examplesetting1 = 1) AND (examplesetting2 < 3)]
+					ControlDependencyDescription:	[
+														To modify this setting, set <b>Example Toggle</b> to <b>ON</b> and <b>Example Slider</b> to <b>less than 3</b>.
+													]
+					ControlDescription:	[
+											This is an example description for a selector that changes the value of examplesetting3 in example_mod.ini. 
+											The selector can have 4 values, listed as SelectorValues. Each value has the displayed text in quotation marks and corresponding value of examplesetting3 after the equals sign.
+											This control has two dependencies, examplesetting1 must equal 1, and at the same time examplesetting2 must have a value less than 3. The AND is used as the AND logic operator. Additonal logic functions available include AND, OR, NOT, NOR, XOR, XNOR, NAND.
+										]
+				}
+				{	ItemType: [Control]
+					ControlTitle: [Example Selector 2]
+					Section: [additional settings]
+					SettingName: [examplesetting4]
+					ControlType: [Selector]
+					SelectorValues: ["Option 5" = stringvalue1, "Option 6" = stringvalue2, "Option 7" = stringvalue3, "Option 8" = stringvalue4]
+					DefaultValue: [stringvalue1]
+					MarkAsModified: [True]
+					ControlDependency: [(settings.examplesetting1 = 0) OR NOT (settings.examplesetting2 = -4)]
+					ControlDependencyDescription:	[
+														To modify this setting, set <b>Example Toggle</b> to <b>OFF</b> or <b>Example Slider</b> to not be <b>-4</b>.
+													]
+					ControlDescription:	[
+											This is an example description for a selector that changes the value of examplesetting4 in example_mod.ini. 
+											This selector changes values that are strings.
+											This control has two dependencies, examplesetting1 must equal 0, OR examplesetting2 must not equal -4. The OR is used as the OR logic operator, and the NOT is used as the NOT logic operator.
+										]
+				}
+				{	ItemType: [Submenu]
+					SubmenuTitle: [Example Submenu]
+					Content:	{
+									{	ItemType: [Control]
+										ControlTitle: [Example  Submenu Toggle 1]
+										Section: [submenu settings]
+										SettingName: [examplesetting5]
+										ControlType: [Toggle]
+										ToggleDisabledValue: ["Disabled" = 0]
+										ToggleEnabledValue: ["Enabled" = 1]
+										DefaultValue: [1]
+										MarkAsModified: [True]
+										ControlDependency: []
+										ControlDescription:	[
+																This is an example description for a toggle that appears on a submenu page within the main menu page.
+															]
+									}
+									{	ItemType: [Control]
+										ControlTitle: [Example  Submenu Toggle 2]
+										Section: [submenu settings]
+										SettingName: [examplesetting6]
+										ControlType: [Toggle]
+										ToggleDisabledValue: ["Disabled" = 0]
+										ToggleEnabledValue: ["Enabled" = 1]
+										DefaultValue: [1]
+										MarkAsModified: [True]
+										ControlDependency: []
+										ControlDescription:	[
+																This is an example description for a toggle that appears on a submenu page within the main menu page.
+															]
+									}
+								}
+				}
+				{	ItemType: [Control]
+					ControlTitle: [Example List]
+					Section: [list settings]
+					SettingName: [examplelistenabled]
+					ControlType: [Toggle]
+					ToggleDisabledValue: ["OFF" = 0]
+					ToggleEnabledValue: ["ON" = 1]
+					DefaultValue: [1]
+					MarkAsModified: [True]
+					ControlDependency: []
+					ControlDescription:	[
+											This is an example description for a toggle that enables a list of toggles that compose a comma separated list in a single ini setting. Disabling this toggle hides the toggles that define the list and disable them, as if the toggles were all individually disabled.
+										]
+				}
+				{	ItemType: [List]
+					Section: [list settings]
+					SettingName: [examplelist]
+					ListDependency: [examplelistenabled = 1]
+					ListDependencyDescription:	[
+													To modify this setting, set <b>Example List</b> to <b>ON</b>.
+												]
+					ListItems:	{
+									{	ItemType: [ListControl]
+										ControlTitle: [Example List Item 1]
+										Section: [list settings]
+										SettingName: [listitemvalue1]
+										ControlType: [Toggle]
+										ToggleDisabledValue: ["DISABLED" = 0]
+										ToggleEnabledValue: ["ENABLED" = 1]
+										ListItemValue: [listitem1]
+										DefaultValue: [1]
+										MarkAsModified: [True]
+										ControlDependency: []
+										ControlDescription:	[
+																This is the first item that appears in a list for the setting examplelist. Enabling this toggle adds the value listitem1 to the list, and disabling removes it from the list.
+															]
+									}
+									{	ItemType: [ListControl]
+										ControlTitle: [Example List Item 2]
+										Section: [list settings]
+										SettingName: [listitemvalue2]
+										ControlType: [Toggle]
+										ToggleDisabledValue: ["DISABLED" = 0]
+										ToggleEnabledValue: ["ENABLED" = 1]
+										ListItemValue: [listitem2]
+										DefaultValue: [1]
+										MarkAsModified: [True]
+										ControlDependency: []
+										ControlDescription:	[
+																This is the second item that appears in a list for the setting examplelist. Enabling this toggle adds the value listitem2 to the list, and disabling removes it from the list.
+															]
+									}
+									{	ItemType: [ListControl]
+										ControlTitle: [Example List Item 3]
+										Section: [list settings]
+										SettingName: [listitemvalue3]
+										ControlType: [Toggle]
+										ToggleDisabledValue: ["DISABLED" = 0]
+										ToggleEnabledValue: ["ENABLED" = 1]
+										ListItemValue: [listitem3]
+										DefaultValue: [1]
+										MarkAsModified: [True]
+										ControlDependency: []
+										ControlDescription:	[
+																This is the third item that appears in a list for the setting examplelist. Enabling this toggle adds the value listitem3 to the list, and disabling removes it from the list.
+															]
+									}
+									{	ItemType: [ListControl]
+										ControlTitle: [Example List Item 4]
+										Section: [list settings]
+										SettingName: [listitemvalue4]
+										ControlType: [Toggle]
+										ToggleDisabledValue: ["DISABLED" = 0]
+										ToggleEnabledValue: ["ENABLED" = 1]
+										ListItemValue: [listitem4]
+										DefaultValue: [0]
+										MarkAsModified: [True]
+										ControlDependency: []
+										ControlDescription:	[
+																This is the fourth item that appears in a list for the setting examplelist. Enabling this toggle adds the value listitem4 to the list, and disabling removes it from the list.
+															]
+									}
+									{	ItemType: [ListControl]
+										ControlTitle: [Example List Item 5]
+										Section: [list settings]
+										SettingName: [listitemvalue5]
+										ControlType: [Toggle]
+										ToggleDisabledValue: ["DISABLED" = 0]
+										ToggleEnabledValue: ["ENABLED" = 1]
+										ListItemValue: [listitem5]
+										DefaultValue: [0]
+										MarkAsModified: [True]
+										ControlDependency: []
+										ControlDescription:	[
+																This is the fifth item that appears in a list for the setting examplelist. Enabling this toggle adds the value listitem5 to the list, and disabling removes it from the list.
+															]
+									}
+									{	ItemType: [ListControl]
+										ControlTitle: [Example List Item 6]
+										Section: [list settings]
+										SettingName: [listitemvalue6]
+										ControlType: [Toggle]
+										ToggleDisabledValue: ["DISABLED" = 0]
+										ToggleEnabledValue: ["ENABLED" = 1]
+										ListItemValue: [{	
+																ItemType: [Control]
+																ControlTitle: [Example List Linked Slider]
+																Section: [list settings]
+																SettingName: [examplelistitemslider]
+																ControlType: [Slider]
+																SliderMinValue: [0.00]
+																SliderMaxValue: [100.00]
+																SliderStepSize: [2.5]
+																DefaultValue: [20.00]
+																MarkAsModified: [True]
+																ControlDependency: [InheritFromParent AND (listitemvalue6 = 1)]
+																ControlDependencyDescription:	[
+																									To modify this setting, set <b>Example List Item 6</b> to <b>ENABLED</b>.
+																								]
+																ControlDescription: [InheritFromParent]
+														}]
+										DefaultValue: [1]
+										MarkAsModified: [True]
+										ControlDependency: []
+										ControlDescription:	[
+																This is the sixth item that appears in a list for the setting examplelist. This control is a toggle with a linked slider value, enabling the toggle inserts the slider value into the list. The InheritFromParent dependency condition passes the dependencies listed in a ListControl's ControlDependency to the linked control, as well as any dependencies applied to the Parent ListControl by the ListDependency argument for the list containing the Parent. The InheritFromParent condition passes the ControlDescription argument from the Parent ListControl to the linked control.
+															]
+									}
+									
+									{	ItemType: [ListControl]
+										ControlTitle: [Example List Item 7]
+										Section: [list settings]
+										SettingName: [listitemvalue7]
+										ControlType: [Toggle]
+										ToggleDisabledValue: ["DISABLED" = 0]
+										ToggleEnabledValue: ["ENABLED" = 1]
+										ListItemValue: [{	
+															ItemType: [Control]
+															ControlTitle: [Example List Linked Selector]
+															Section: [list settings]
+															SettingName: [examplelistitemselector]
+															ControlType: [Selector]
+															SelectorValues: ["List Selector Option 1" = selectorlistitem1, "List Selector Option 2" = selectorlistitem2, "List Selector Option 3" = selectorlistitem3, "List Selector Option 4" = selectorlistitem4]
+															DefaultValue: [selectorlistitem1]
+															MarkAsModified: [True]
+															ControlDependency: [InheritFromParent AND (listitemvalue7 = 1)]
+															ControlDependencyDescription:	[
+																								To modify this setting, set <b>Example List Item 7</b> to <b>ENABLED</b>.
+																							]
+															ControlDescription: [InheritFromParent]
+														}]
+										DefaultValue: [1]
+										MarkAsModified: [True]
+										ControlDependency: []
+										ControlDescription:	[
+																This is the seventh item that appears in a list for the setting examplelist. This control is a toggle with a linked selector value, enabling the toggle inserts the selector value into the list. The InheritFromParent dependency condition passes the dependencies listed in a ListControl's ControlDependency to the linked control, as well as any dependencies applied to the Parent ListControl by the ListDependency argument for the list containing the Parent. The InheritFromParent condition passes the ControlDescription argument from the Parent ListControl to the linked control.
+															]
+									}
+								}
+				}
+			}
