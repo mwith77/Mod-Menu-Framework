@@ -347,9 +347,12 @@ static void pushPageHook(void* registers, void*) {
 /* Every tick: make sure the text cache is found - the game may load its text
    database after the framework started - then the labels of the open page go
    back into it. */
+static void keybindTick(void);
+
 static void listenerUpdateHook(void*, void*) {
     ensureTextCache();
     registerPageTexts(global_lastPageName);
+    keybindTick();
 }
 
 /* The longest widget file name, and the longest data source name, both as the
@@ -1041,6 +1044,8 @@ static int textIsExpression(const char* text, int page);
 #define MODPAGE_TOGGLE        0
 #define MODPAGE_SELECTOR      1
 #define MODPAGE_SLIDER        2
+#define MODPAGE_PRESET        3
+#define MODPAGE_KEYBIND       4
 
 /* Keys a block can take from its parent with InheritFromParent. */
 #define INHERIT_TITLE         0x01
@@ -1121,8 +1126,19 @@ struct ModPageItem {
     char  visibility[MODPAGE_EXPRESSION];
     char  optionCountExpression[MODPAGE_EXPRESSION];
     char  optionLabelExpression[MODPAGE_EXPRESSION];
+    /* SliderValueText: the text a slider shows for its value, an expression
+       in which VALUE stands for the value. Empty shows the number. */
+    char  valueText[MODPAGE_EXPRESSION];
     int   logarithmic;     /* SliderStepSize: [Logarithmic] */
     float smallestStep;    /* SliderSmallestStep, 0 where it is not written */
+    /* A keybind: KeybindAllowMenuKeys and KeybindAllowGameplayKeys, whether
+       it may take a key the game's controls bind to a menu action, and to an
+       action outside the menus. 1 and 0 where the file does not say. */
+    int   allowMenuKeys;
+    int   allowGameplayKeys;
+    /* A preset: its first preset in global_preset; its options are the
+       presets, then the one that stands for settings that match none. */
+    int   firstPreset;
     ModPageOption option[MAX_MODPAGE_OPTIONS];
 };
 
@@ -1179,6 +1195,7 @@ static const TextKey global_itemTextKey[] = {
     { { "ControlVisibility" }, ITEM_FIELD(visibility), 0, "visibility" },
     { { "SelectorCount" }, ITEM_FIELD(optionCountExpression), 0, "option count" },
     { { "SelectorLabel" }, ITEM_FIELD(optionLabelExpression), 0, "option label" },
+    { { "SliderValueText" }, ITEM_FIELD(valueText), 0, "slider value text" },
 };
 
 static const TextKey global_pageTextKey[] = {
@@ -1251,8 +1268,8 @@ static const PageFormula* formulaNamed(int page, const char* name,
    functions, whose names make a value an expression. */
 static const char* const global_reservedWord[] = {
     "IF", "IFS", "IFERROR", "CONCAT", "FRACTION", "LET", "CHOOSE", "SETTING",
-    "STEPUP", "OPTION", "True", "False", "NOT", "AND", "NAND", "OR", "NOR",
-    "XOR", "XNOR"
+    "STEPUP", "OPTION", "VALUE", "True", "False", "NOT", "AND", "NAND", "OR",
+    "NOR", "XOR", "XNOR"
 };
 #define FUNCTION_WORDS 9
 
@@ -1410,6 +1427,8 @@ static void readFormula(ModPageCursor* c, int page, const char* text) {
     f.page = page;
 
     const char* at = pastBlanks(text);
+    /* Formula: [] defines nothing, and is not a fault. */
+    if (!*at) return;
     const char* const nameFrom = at;
     while (*at && nameCharacter(*at)) ++at;
     const size_t nameLength = (size_t)(at - nameFrom);
@@ -1601,7 +1620,148 @@ static int controlTypeFromName(const char* text) {
     if (!_stricmp(text, "Toggle"))   return MODPAGE_TOGGLE;
     if (!_stricmp(text, "Selector")) return MODPAGE_SELECTOR;
     if (!_stricmp(text, "Slider"))   return MODPAGE_SLIDER;
+    if (!_stricmp(text, "Preset"))   return MODPAGE_PRESET;
+    if (!_stricmp(text, "Keybind"))  return MODPAGE_KEYBIND;
     return -1;
+}
+
+/*
+    Presets: a selector whose options each set several settings at once.
+
+        ControlType: [Preset]
+        PresetValues: ["Default" = {corner = 3, size = 100, opacity = 70},
+                       "Faint" = {size = 70, opacity = 30}]
+        PresetCustomText: [Custom]
+
+    Each preset is a label and, in braces, the settings it sets: a name, read
+    the way an expression reads one (a control of the page, or a key in its
+    settings file, as key or section.key, a name without a section being read
+    in the preset's own section), "=", and the value, in quotes where it holds
+    a comma or a brace. The options are the presets in the order written, and
+    after them one more, Custom unless PresetCustomText names it otherwise.
+
+    A preset keeps no value of its own. The option it shows is the first preset
+    all of whose settings hold its values, and Custom when none does. Choosing
+    a preset sets its settings; leaving Custom for a preset first puts aside
+    what every setting the presets name holds, and choosing Custom puts those
+    values back. DefaultValue, where written, is the number of the preset that
+    counts as its default, for MarkAsModified.
+*/
+#define MAX_PRESETS          256   /* presets in every menupage together */
+#define MAX_PRESET_SETTINGS  32    /* settings one preset sets */
+#define MAX_PRESET_NAMES     ((MAX_MODPAGE_OPTIONS - 1) * MAX_PRESET_SETTINGS)
+#define MAX_PRESET_TEXT      (MODPAGE_EXPRESSION * 4)
+
+struct PresetSetting {
+    char name[MODPAGE_NAME * 2];
+    char value[MODPAGE_VALUE];
+};
+
+struct Preset {
+    int           item;
+    char          label[MODPAGE_TITLE];
+    int           count;
+    PresetSetting setting[MAX_PRESET_SETTINGS];
+};
+
+static Preset global_preset[MAX_PRESETS];
+static int    global_presetCount = 0;
+
+/* The text from first to last, trimmed, with a pair of quotes around it
+   dropped. */
+static void copyPresetWord(const char* first, const char* last, char* out,
+                           size_t room, const char* what) {
+    while (first < last && (unsigned char)*first <= ' ') ++first;
+    while (last > first && (unsigned char)last[-1] <= ' ') --last;
+    if (last - first >= 2 && *first == '"' && last[-1] == '"') { ++first; --last; }
+    char word[MAX_PRESET_TEXT];
+    size_t at = 0;
+    for (; first < last && at + 1 < sizeof(word); ++first) word[at++] = *first;
+    word[at] = 0;
+    copyBounded(out, room, word, what);
+}
+
+/* Where the next of stops outside quotes is, or last. */
+static const char* presetStop(const char* at, const char* last,
+                              const char* stops) {
+    for (int quoted = 0; at < last; ++at) {
+        if (*at == '"') quoted = !quoted;
+        else if (!quoted && strchr(stops, *at)) return at;
+    }
+    return last;
+}
+
+/*
+    PresetValues, into presets for the block item. Answers how many were read;
+    a preset written wrongly is reported and left out, and the rest are read.
+*/
+static int readPresets(ModPageCursor* c, int item, const char* text) {
+    int count = 0;
+    const char* at = text;
+    const char* const end = text + strlen(text);
+    for (;;) {
+        while (at < end && ((unsigned char)*at <= ' ' || *at == ',')) ++at;
+        if (at >= end) break;
+        const char* equals = presetStop(at, end, "={");
+        if (equals >= end || *equals != '=') {
+            modPageFault(c, "a preset is written \"label\" = {name = value, ...}; "
+                            "the rest of PresetValues was not read");
+            break;
+        }
+        const char* open = equals + 1;
+        while (open < end && (unsigned char)*open <= ' ') ++open;
+        const char* close = open < end && *open == '{'
+                          ? presetStop(open + 1, end, "}") : end;
+        if (open >= end || *open != '{' || close >= end) {
+            modPageFault(c, "a preset's settings are written in braces after its "
+                            "\"=\"; the rest of PresetValues was not read");
+            break;
+        }
+        if (count >= MAX_MODPAGE_OPTIONS - 1 || global_presetCount >= MAX_PRESETS) {
+            modPageFault(c, "there is room for %d presets on a control and %d in "
+                            "all, so the rest were left out",
+                         MAX_MODPAGE_OPTIONS - 1, MAX_PRESETS);
+            break;
+        }
+        Preset* p = &global_preset[global_presetCount];
+        memset(p, 0, sizeof(*p));
+        p->item = item;
+        copyPresetWord(at, equals, p->label, sizeof(p->label), "preset label");
+        for (const char* one = open + 1; one < close; ) {
+            const char* stop = presetStop(one, close, ",");
+            const char* sign = presetStop(one, stop, "=");
+            if (sign < stop) {
+                if (p->count >= MAX_PRESET_SETTINGS) {
+                    modPageFault(c, "the preset \"%s\" sets more than %d settings, "
+                                    "so the rest were left out", p->label,
+                                 MAX_PRESET_SETTINGS);
+                    break;
+                }
+                PresetSetting* s = &p->setting[p->count];
+                copyPresetWord(one, sign, s->name, sizeof(s->name),
+                               "preset setting name");
+                copyPresetWord(sign + 1, stop, s->value, sizeof(s->value),
+                               "preset setting value");
+                if (s->name[0]) ++p->count;
+            } else {
+                const char* word = one;
+                while (word < stop && (unsigned char)*word <= ' ') ++word;
+                if (word < stop)
+                    modPageFault(c, "a setting of the preset \"%s\" has no \"=\", "
+                                    "so it was left out", p->label);
+            }
+            one = stop < close ? stop + 1 : close;
+        }
+        if (!p->label[0] || !p->count)
+            modPageFault(c, "a preset needs a label and at least one setting, so "
+                            "\"%s\" was left out", p->label);
+        else {
+            ++global_presetCount;
+            ++count;
+        }
+        at = close + 1;
+    }
+    return count;
 }
 
 static int readBlock(ModPageCursor* c, int parent, int page, int file);
@@ -1658,6 +1818,8 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
     item->controlType = -1;
     item->html = -1;
     item->step = 1.0f;
+    item->allowMenuKeys = 1;
+    item->allowGameplayKeys = 0;
 
     for (;;) {
         skipBlanks(c);
@@ -1726,7 +1888,17 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
                              key->what);
         }
         else if (!_stricmp(name, "ItemType"))    item->itemType = itemTypeFromName(value);
-        else if (!_stricmp(name, "ControlType")) item->controlType = controlTypeFromName(value);
+        else if (!_stricmp(name, "ControlType")) {
+            item->controlType = controlTypeFromName(value);
+            /* A row of a kind this framework does not draw would be drawn as
+               a toggle with no options; the block goes instead. */
+            if (item->controlType < 0) {
+                item->refused = 1;
+                writeLog("MODPAGE %s: ControlType \"%s\" is not one this "
+                         "framework has, so the block holding it was skipped",
+                         c->name, value);
+            }
+        }
         else if (!_stricmp(name, "ModPage")) {
             /* A menupage in the mod menu folder, by file name without its
                extension. The page it generates is named for the same stem. */
@@ -1760,6 +1932,17 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
             if (inherits) item->inherited |= INHERIT_MARK;
             else item->markAsModified = !_stricmp(value, "True");
         }
+        else if (!_stricmp(name, "KeybindAllowMenuKeys")
+                 || !_stricmp(name, "KeybindAllowGameplayKeys")) {
+            int* allow = !_stricmp(name, "KeybindAllowMenuKeys")
+                       ? &item->allowMenuKeys : &item->allowGameplayKeys;
+            if (!_stricmp(value, "True")) *allow = 1;
+            else if (!_stricmp(value, "False")) *allow = 0;
+            else
+                writeLog("MODPAGE %s: %s is \"%s\", which is neither True nor "
+                         "False, so %s was used", c->name, name, value,
+                         *allow ? "True" : "False");
+        }
         else if (!_stricmp(name, "descriptionHTML")) {
             if (inherits) item->inherited |= INHERIT_HTML;
             else item->html = !_stricmp(value, "True");
@@ -1784,6 +1967,16 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
         else if (!_stricmp(name, "SelectorValues"))
             item->optionCount = readOptions(value, item->option,
                                             MAX_MODPAGE_OPTIONS, file);
+        else if (!_stricmp(name, "PresetValues")) {
+            item->firstPreset = global_presetCount;
+            item->optionCount = readPresets(c, me, value);
+        }
+        else if (!_stricmp(name, "PresetCustomText"))
+            /* Kept in the last option until the block ends, where the option
+               after the presets takes it. */
+            copyBounded(item->option[MAX_MODPAGE_OPTIONS - 1].label,
+                        sizeof(item->option[0].label), value,
+                        "preset custom text");
         else if (!_stricmp(name, "ToggleDisabledValue")
                  || !_stricmp(name, "ToggleEnabledValue")) {
             readOption(value, &item->option[!_stricmp(name, "ToggleEnabledValue")],
@@ -1796,6 +1989,40 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
             item->refused = 1;
             writeLog("MODPAGE %s: \"%s\" is not a key this format has, so the "
                      "block holding it was skipped", c->name, name);
+        }
+    }
+
+    /* A preset's options: the presets, then the one for settings that match
+       none. It is named for its block where its page does not name it. */
+    if (item->itemType == ITEM_CONTROL && item->controlType == MODPAGE_PRESET
+        && !item->refused) {
+        const int presets = item->optionCount;
+        if (presets <= 0) {
+            item->refused = 1;
+            writeLog("MODPAGE %s: a Preset lists no preset in PresetValues, so "
+                     "the block holding it was skipped", c->name);
+        } else {
+            char custom[MODPAGE_TITLE];
+            copyBounded(custom, sizeof(custom),
+                        item->option[MAX_MODPAGE_OPTIONS - 1].label[0]
+                            ? item->option[MAX_MODPAGE_OPTIONS - 1].label
+                            : "Custom", "preset custom text");
+            for (int o = 0; o < presets; ++o) {
+                copyBounded(item->option[o].label, sizeof(item->option[o].label),
+                            global_preset[item->firstPreset + o].label,
+                            "preset label");
+                sprintf_s(item->option[o].value, "%d", o + 1);
+                item->option[o].expression = 0;
+            }
+            copyBounded(item->option[presets].label,
+                        sizeof(item->option[presets].label), custom,
+                        "preset custom text");
+            strcpy_s(item->option[presets].value,
+                     sizeof(item->option[presets].value), "custom");
+            item->option[presets].expression = 0;
+            item->optionCount = presets + 1;
+            if (!item->settingName[0])
+                sprintf_s(item->settingName, "preset-%d", me);
         }
     }
     return me;
@@ -2070,6 +2297,11 @@ static void loadModPages() {
 #define PAGE_TEMPLATE_NAME "page-framework"
 #define LANDING_PAGE_NAME  "mods/page-mod-config"
 #define ROW_HEIGHT         118
+/* How high a row is: the selector, slider and button rows the game's options
+   pages draw are 58 high; the game's keybind rows are 150. The page lays its
+   rows out one under another, so a taller row pushes the rest down. */
+#define ROW_ITEM_HEIGHT     58
+#define KEYBIND_ROW_HEIGHT  150
 /*
     A row that opens a page takes its label from the cipherId on the page item,
     which the engine looks up in the text database when the row is built. A
@@ -2114,13 +2346,21 @@ static void keepPageText(const char* page, const char* cipherId,
 
 #define BUTTON_WIDGET "menu/components/button-default.widget"
 
-static const char* const global_rowWidget[3] = {
+/* The row a keybind draws in, a widget file of ours: see keybindRowDocument. */
+#define KEYBIND_ROW_NAME   "mods/keybind-row"
+#define KEYBIND_ROW_WIDGET KEYBIND_ROW_NAME ".widget"
+/* The event a keybind's row sends when it is chosen. */
+#define KEYBIND_EVENT      "modmenu-keybind"
+
+static const char* const global_rowWidget[5] = {
     "menu/components/selector-default_alternate.widget",
     "menu/components/selector-default.widget",
-    "menu/components/slider-default.widget"
+    "menu/components/slider-default.widget",
+    "menu/components/selector-default.widget",   /* a preset */
+    KEYBIND_ROW_WIDGET                             /* a keybind */
 };
 
-/* One row of a page, with the five things that differ between rows. */
+/* One row of a page, with the six things that differ between rows. */
 static const char* const global_rowPattern =
     "{\"animation\":{\"keyframes\":{}},\"anchorMaxN.x\":1.0,\"anchorMaxN.y\":0.0,"
     "\"anchorMinN.x\":0.0,\"anchorMinN.y\":0.0,\"cipherId\":\"%s\","
@@ -2131,7 +2371,7 @@ static const char* const global_rowPattern =
     "\"locked\":0,\"name\":\"%s\",\"noSpawn\":0,"
     "\"parent\":\"22f9fe5c15e3735b533166e08b913e39\",\"pivotAs.x\":0.0,"
     "\"pivotAs.y\":%d.0,\"pivotN.x\":0.0,\"pivotN.y\":0.0,"
-    "\"rectSizeDelta.height\":58.0,\"rectSizeDelta.width\":0.0,\"rotation\":0.0,"
+    "\"rectSizeDelta.height\":%d.0,\"rectSizeDelta.width\":0.0,\"rotation\":0.0,"
     "\"scale.x\":1.0,\"scale.y\":1.0,\"source\":\"%s\",\"tags\":{%s},"
     "\"tint.blend\":0.0,\"tint.end\":4294967295,\"tint.start\":4294967295,"
     "\"visible\":1}";
@@ -2266,10 +2506,11 @@ static void keepGeneratedPage(const char* name, char* text, uint32_t length) {
 /* One row put on the end of a page being built. Answers 0 where it does not
    fit. */
 static int appendRow(char* text, uint32_t* at, const char* cipherId, int r,
-                     const char* rowName, const char* widget, const char* tags) {
+                     const char* rowName, const char* widget, const char* tags,
+                     int height = ROW_ITEM_HEIGHT) {
     char row[2048];
     const int wrote = sprintf_s(row, sizeof(row), global_rowPattern, cipherId,
-                                r, rowName, r * ROW_HEIGHT, widget, tags);
+                                r, rowName, r * ROW_HEIGHT, height, widget, tags);
     if (wrote <= 0 || *at + (uint32_t)wrote + 4 >= MAX_PAGE_BYTES) return 0;
     text[(*at)++] = ',';
     memcpy(text + *at, row, (size_t)wrote);
@@ -2449,10 +2690,23 @@ static void generateOnePage(int pageIndex, int owner, const char* name,
         } else {
             widget = global_rowWidget[item->controlType < 0 ? MODPAGE_TOGGLE
                                                             : item->controlType];
-            sprintf_s(tags, "\"dataSource\":\"%s\"", item->settingName);
+            /* A keybind's row is a button whose choosing sends KEYBIND_EVENT,
+               on which the framework takes the next key held. */
+            if (item->controlType == MODPAGE_KEYBIND)
+                sprintf_s(tags, "\"action\":\"send-event %s\","
+                                "\"allowTtsOnFocus\":\"true\","
+                                "\"dataSource\":\"%s\"", KEYBIND_EVENT,
+                          item->settingName);
+            else
+                sprintf_s(tags, "\"dataSource\":\"%s\"", item->settingName);
             sprintf_s(rowName, "row%d", rows[r]);
         }
-        if (!appendRow(text, &at, cipherId, r, rowName, widget, tags)) break;
+        const int height = item->itemType != ITEM_SUBMENU
+                           && item->itemType != ITEM_PAGELINK
+                           && item->controlType == MODPAGE_KEYBIND
+                         ? KEYBIND_ROW_HEIGHT : ROW_ITEM_HEIGHT;
+        if (!appendRow(text, &at, cipherId, r, rowName, widget, tags, height))
+            break;
     }
     if (at + 4 >= MAX_PAGE_BYTES) {
         free(text);
@@ -2504,8 +2758,321 @@ static void generateLandingPage(const MenuFile* template_) {
     closePage(LANDING_PAGE_NAME, text, at);
 }
 
+/*
+    The row a keybind draws in: the game's own row from its Customise Controls
+    page, rebuilt from three widget files of ours, each the game's file with
+    its engine class taken out where that class works only on the game's own
+    bindings.
+
+    mods/keybind-row        menu/list-items/item-button-remap-default-pc, 150
+                            high, its root a Menu2::Button (so choosing it runs
+                            its action) in place of a Menu2::Component, with
+                            the row's hover background, its background for a
+                            row whose key is being set, and its states normal,
+                            focused, secondary_focused, disabled and
+                            focused_disabled
+    mods/keybind-row-ref    item-button-remap-default-ref-pc: the title
+                            (label0, menu-button-smaller) and one cell,
+                            keybindCell, where the game's rightmost column
+                            stands; the game's row has three (two keys and a
+                            pad button)
+    mods/keybind-cell       item-button-remap-default-column-prim-kbm-pc
+                            without Menu2::RemapColumnItems: the cell's frame
+                            (columnItemRefPrimKbm, the game's ...-column-item-
+                            pc), the key's icon (primaryKeyboardIcon), a name
+                            for a key the game has no icon for (keyName, ours),
+                            and the binding texts (bindingTexts, the game's
+                            ...-default-text-pc), with the states normal,
+                            hovered, disabled and hovered_disabled
+
+    The framework fills the cell and plays the states the game's page plays
+    (keybindTick).
+*/
+#define KEYBIND_REF_NAME   "mods/keybind-row-ref"
+#define KEYBIND_CELL_NAME  "mods/keybind-cell"
+
+static const char global_keybindRowDocument[] =
+    "{\"size\":[2000.0,150.0],\"grid\":[100,100],\"lang\":\"eng\",\"defaultEngineCla"
+    "ss\":\"\",\"defaultScript\":\"\",\"fps\":60.0,\"478710ee764acc8e\":30.0,\"currentF"
+    "rame\":0.0,\"textTracking.x\":0.0,\"textTracking.y\":0.0,\"animation\":{\"labe"
+    "ls\":[{\"label\":\"disabled\",\"loop\":0,\"range\":[1.5,1.5],\"rate\":1.0,\"revCur"
+    "ve\":0},{\"label\":\"focused\",\"loop\":0,\"range\":[0.5,0.5],\"rate\":1.0,\"revCu"
+    "rve\":0},{\"label\":\"focused_disabled\",\"loop\":0,\"range\":[2.0,2.0],\"rate\":"
+    "1.0,\"revCurve\":0},{\"label\":\"normal\",\"loop\":0,\"range\":[0.0,0.0],\"rate\":"
+    "1.0,\"revCurve\":0},{\"label\":\"secondary_focused\",\"loop\":0,\"range\":[0.75,"
+    "0.75],\"rate\":1.0,\"revCurve\":0},{\"label\":\"disabled^focused_disabled\",\"l"
+    "oop\":0,\"range\":[1.5,2.0],\"rate\":2.0,\"revCurve\":0},{\"label\":\"focused^no"
+    "rmal\",\"loop\":0,\"range\":[0.5,0.0],\"rate\":2.0,\"revCurve\":0},{\"label\":\"fo"
+    "cused^secondary_focused\",\"loop\":0,\"range\":[0.5,0.75],\"rate\":1.0,\"revCu"
+    "rve\":0},{\"label\":\"focused_disabled^disabled\",\"loop\":0,\"range\":[2.0,1.5"
+    "],\"rate\":2.0,\"revCurve\":0},{\"label\":\"normal^focused\",\"loop\":0,\"range\":"
+    "[0.0,0.5],\"rate\":2.0,\"revCurve\":0},{\"label\":\"secondary_focused^focused"
+    "\",\"loop\":0,\"range\":[0.75,0.5],\"rate\":1.0,\"revCurve\":0}]},\"items\":[{\"an"
+    "imation\":{\"keyframes\":{}},\"anchorMaxN.x\":1.0,\"anchorMaxN.y\":0.5,\"ancho"
+    "rMinN.x\":0.0,\"anchorMinN.y\":0.5,\"class\":\"Group\",\"color.a\":255,\"depth\":"
+    "0.0,\"engineClass\":\"Menu2::Button\",\"flowDirection\":\"Vertical\",\"flowGrid"
+    "Size.x\":0,\"flowGridSize.y\":0,\"flowMargins.b\":0.0,\"flowMargins.l\":0.0,\""
+    "flowMargins.r\":0.0,\"flowMargins.t\":0.0,\"flowSpacing\":0.0,\"focusable\":1"
+    ",\"guid\":\"780ba25d863da4448f9d404b2f5d0d68\",\"inheritAlpha\":1,\"inheritRo"
+    "tation\":1,\"inheritScale\":1,\"inheritTint\":0,\"isHoverable\":1,\"isMaskInve"
+    "rted\":0,\"isMaskOrClip\":0,\"layoutMode\":\"Unspecified\",\"locked\":0,\"name\":"
+    "\"root\",\"noSpawn\":0,\"parent\":null,\"pivotAs.x\":0.0,\"pivotAs.y\":-75.0,\"pi"
+    "votN.x\":0.100000001,\"pivotN.y\":0.0,\"rectSizeDelta.height\":150.0,\"rectS"
+    "izeDelta.width\":0.0,\"resizeDirection\":\"Vertical\",\"rotation\":0.0,\"scale"
+    ".x\":1.0,\"scale.y\":1.0,\"tint.blend\":0.0,\"tint.end\":4294967295,\"tint.sta"
+    "rt\":4294967295,\"visible\":1},{\"animation\":{\"keyframes\":{\"fcolor.a\":{\"ty"
+    "pe\":\"float\",\"keys\":[0.0,0.5,0.75,1.5,2.0],\"values\":[1.0,1.0,0.0,1.0,1."
+    "0],\"curveTypes\":[null,null,null,null,null]}}},\"anchorMaxN.x\":1.0,\"anch"
+    "orMaxN.y\":1.0,\"anchorMinN.x\":0.0,\"anchorMinN.y\":0.0,\"class\":\"Reference"
+    "\",\"color.a\":255,\"depth\":0.0,\"focusable\":1,\"guid\":\"da3de1ed867b954581d7"
+    "ddb457958776\",\"inheritAlpha\":1,\"inheritRotation\":1,\"inheritScale\":1,\"i"
+    "nheritTint\":0,\"isHoverable\":1,\"isMaskInverted\":0,\"isMaskOrClip\":0,\"lay"
+    "outMode\":\"Exclude\",\"locked\":0,\"name\":\"hoverBg\",\"noSpawn\":0,\"parent\":\"7"
+    "80ba25d863da4448f9d404b2f5d0d68\",\"pivotAs.x\":17.0,\"pivotAs.y\":0.0,\"piv"
+    "otN.x\":0.5,\"pivotN.y\":0.5,\"rectSizeDelta.height\":16.0,\"rectSizeDelta.w"
+    "idth\":34.0,\"rotation\":0.0,\"scale.x\":1.0,\"scale.y\":1.0,\"source\":\"menu/c"
+    "omponents/hover-bg_hide-unhovered.widget\",\"tint.blend\":0.0,\"tint.end\":"
+    "4294967295,\"tint.start\":4294967295,\"visible\":1},{\"animation\":{\"keyfram"
+    "es\":{\"fcolor.a\":{\"type\":\"float\",\"keys\":[0.0,0.5,1.5,2.0],\"values\":[1.0"
+    ",1.0,1.0,1.0],\"curveTypes\":[\"EaseInOut2\",\"EaseInOut2\",\"EaseInOut2\",\"Ea"
+    "seInOut2\"]},\"tint\":{\"type\":\"QColor\",\"keys\":[0.0,0.5,1.5,2.0],\"values\":"
+    "[\"t2-menu-normal\",\"t2-menu-focused\",\"t2-menu-disabled\",\"t2-menu-focuse"
+    "d-disabled\"],\"curveTypes\":[\"EaseInOut2\",\"EaseInOut2\",\"EaseInOut2\",\"Eas"
+    "eInOut2\"]}}},\"anchorMaxN.x\":1.0,\"anchorMaxN.y\":0.0,\"anchorMinN.x\":0.0,"
+    "\"anchorMinN.y\":0.0,\"class\":\"Reference\",\"color.a\":255,\"depth\":1.0,\"focu"
+    "sable\":1,\"guid\":\"3af04c11d633e54b86488698890f9fb6\",\"inheritAlpha\":1,\"i"
+    "nheritRotation\":1,\"inheritScale\":1,\"inheritTint\":0,\"isHoverable\":0,\"is"
+    "MaskInverted\":0,\"isMaskOrClip\":0,\"layoutMode\":\"Exclude\",\"locked\":0,\"na"
+    "me\":\"reference\",\"noSpawn\":0,\"parent\":\"780ba25d863da4448f9d404b2f5d0d68"
+    "\",\"pivotAs.x\":0.0,\"pivotAs.y\":20.0,\"pivotN.x\":0.0,\"pivotN.y\":0.0,\"rect"
+    "SizeDelta.height\":110.0,\"rectSizeDelta.width\":0.0,\"rotation\":0.0,\"scal"
+    "e.x\":1.0,\"scale.y\":1.0,\"source\":\"mods/keybind-row-ref.widget\",\"tint.bl"
+    "end\":0.0,\"tint.end\":\"t2-menu-disabled\",\"tint.start\":\"t2-menu-focused\","
+    "\"visible\":1},{\"animation\":{\"keyframes\":{\"fcolor.a\":{\"type\":\"float\",\"ke"
+    "ys\":[0.0,0.5,0.75,1.5,2.0],\"values\":[0.0,0.0,1.0,0.0,0.0],\"curveTypes\""
+    ":[null,null,null,null,null]}}},\"anchorMaxN.x\":1.0,\"anchorMaxN.y\":1.0,\""
+    "anchorMinN.x\":0.0,\"anchorMinN.y\":0.0,\"class\":\"Group\",\"color.a\":0,\"dept"
+    "h\":2.0,\"flowDirection\":\"NoFlow\",\"flowGridSize.x\":0,\"flowGridSize.y\":0,"
+    "\"flowMargins.b\":0.0,\"flowMargins.l\":0.0,\"flowMargins.r\":0.0,\"flowMargi"
+    "ns.t\":0.0,\"flowSpacing\":0.0,\"focusable\":1,\"guid\":\"fc612ed2e49ab64fb4eb"
+    "0be152353e7c\",\"inheritAlpha\":1,\"inheritRotation\":1,\"inheritScale\":1,\"i"
+    "nheritTint\":0,\"isHoverable\":0,\"isMaskInverted\":0,\"isMaskOrClip\":0,\"lay"
+    "outMode\":\"Exclude\",\"locked\":0,\"name\":\"bgGroup\",\"noSpawn\":0,\"parent\":\"7"
+    "80ba25d863da4448f9d404b2f5d0d68\",\"pivotAs.x\":17.0,\"pivotAs.y\":0.0,\"piv"
+    "otN.x\":0.5,\"pivotN.y\":0.5,\"rectSizeDelta.height\":16.0,\"rectSizeDelta.w"
+    "idth\":34.0,\"resizeDirection\":\"NoResize\",\"rotation\":0.0,\"scale.x\":1.0,\""
+    "scale.y\":1.0,\"tint.blend\":0.0,\"tint.end\":4294967295,\"tint.start\":42949"
+    "67295,\"visible\":1},{\"animation\":{\"keyframes\":{}},\"alignH\":0,\"alignV\":0"
+    ",\"anchorMaxN.x\":1.0,\"anchorMaxN.y\":1.0,\"anchorMinN.x\":0.0,\"anchorMinN."
+    "y\":0.0,\"autoSize\":0,\"class\":\"Image\",\"color.a\":255,\"depth\":2.0,\"effect\""
+    ":\"Regular\",\"explicitSize\":0,\"focusable\":0,\"guid\":\"999743b9760cb04aad94"
+    "178bddeda571\",\"inheritAlpha\":1,\"inheritRotation\":1,\"inheritScale\":1,\"i"
+    "nheritTint\":0,\"isHoverable\":0,\"isMaskInverted\":0,\"isMaskOrClip\":0,\"lay"
+    "outMode\":\"Unspecified\",\"locked\":0,\"name\":\"hoverBgFilling\",\"noSpawn\":0,"
+    "\"parent\":\"fc612ed2e49ab64fb4eb0be152353e7c\",\"path\":\"general-textures/s"
+    "quare-32px.png\",\"pivotAs.x\":0.0,\"pivotAs.y\":0.0,\"pivotN.x\":0.5,\"pivotN"
+    ".y\":0.5,\"rasterSize.height\":0.0,\"rasterSize.width\":0.0,\"rectSizeDelta."
+    "height\":0.0,\"rectSizeDelta.width\":0.0,\"rotation\":0.0,\"scale.x\":1.0,\"sc"
+    "ale.y\":1.0,\"scaleMode\":\"Stretch\",\"slices\":[0.328099996,0.328099996,0.3"
+    "28099996,0.328099996],\"tint.blend\":0.0,\"tint.end\":\"t2-slot-bg-white\",\""
+    "tint.start\":\"t2-slot-bg-white\",\"visible\":1},{\"animation\":{\"keyframes\":"
+    "{\"fcolor.a\":{\"type\":\"float\",\"keys\":[0.0,0.25,0.5,0.75],\"values\":[1.0,1"
+    ".0,1.0,0.101960786],\"curveTypes\":[null,null,null,null]}}},\"anchorMaxN."
+    "x\":1.0,\"anchorMaxN.y\":1.0,\"anchorMinN.x\":0.0,\"anchorMinN.y\":0.0,\"capSt"
+    "yle\":\"Flat\",\"class\":\"Polyline\",\"closed\":1,\"color.a\":255,\"depth\":3.0,\"e"
+    "ffect\":\"Regular\",\"focusable\":0,\"guid\":\"7f9e4a1a71f9e045af4ea79c9eef3c4"
+    "b\",\"inheritAlpha\":1,\"inheritRotation\":1,\"inheritScale\":1,\"inheritTint\""
+    ":0,\"isHoverable\":0,\"isMaskInverted\":0,\"isMaskOrClip\":0,\"joinStyle\":\"Mi"
+    "ter\",\"layoutMode\":\"Exclude\",\"lineWidth\":2.0,\"locked\":0,\"name\":\"hoverBg"
+    "Outline\",\"noSpawn\":0,\"parent\":\"fc612ed2e49ab64fb4eb0be152353e7c\",\"pivo"
+    "tAs.x\":0.0,\"pivotAs.y\":0.0,\"pivotN.x\":0.5,\"pivotN.y\":0.5,\"pointsUv\":[0"
+    ".0,0.0,0.0,1.0,1.0,1.0,1.0,0.0],\"rectSizeDelta.height\":-2.0,\"rectSizeD"
+    "elta.width\":-2.0,\"rotation\":0.0,\"scale.x\":1.0,\"scale.y\":1.0,\"tint.blen"
+    "d\":0.0,\"tint.end\":\"t2-white\",\"tint.start\":\"t2-white\",\"visible\":1}]}";
+
+static const char global_keybindRefDocument[] =
+    "{\"size\":[2000.0,160.0],\"grid\":[100,100],\"lang\":\"eng\",\"defaultEngineCla"
+    "ss\":\"\",\"defaultScript\":\"\",\"fps\":60.0,\"478710ee764acc8e\":30.0,\"currentF"
+    "rame\":15.0,\"textTracking.x\":0.0,\"textTracking.y\":0.0,\"685a017374c5cfe3"
+    "\":1,\"animation\":{\"labels\":[{\"label\":\"binding\",\"loop\":0,\"range\":[0.25,0"
+    ".25],\"rate\":1.0,\"revCurve\":0},{\"label\":\"bound\",\"loop\":0,\"range\":[0.5,0"
+    ".5],\"rate\":1.0,\"revCurve\":0},{\"label\":\"unbound\",\"loop\":0,\"range\":[1.0,"
+    "1.0],\"rate\":1.0,\"revCurve\":0},{\"label\":\"unbound_binding\",\"loop\":0,\"ran"
+    "ge\":[0.75,0.75],\"rate\":1.0,\"revCurve\":0},{\"label\":\"binding^bound\",\"loo"
+    "p\":0,\"range\":[0.25,0.5],\"rate\":1.0,\"revCurve\":0},{\"label\":\"bound^bindi"
+    "ng\",\"loop\":0,\"range\":[0.5,0.25],\"rate\":1.0,\"revCurve\":0},{\"label\":\"unb"
+    "ound^unbound_binding\",\"loop\":0,\"range\":[1.0,0.75],\"rate\":1.0,\"revCurve"
+    "\":0},{\"label\":\"unbound_binding^bound\",\"loop\":0,\"range\":[0.75,0.5],\"rat"
+    "e\":1.0,\"revCurve\":0},{\"label\":\"unbound_binding^unbound\",\"loop\":0,\"rang"
+    "e\":[0.75,1.0],\"rate\":1.0,\"revCurve\":0}]},\"items\":[{\"animation\":{\"keyfr"
+    "ames\":{}},\"anchorMaxN.x\":1.0,\"anchorMaxN.y\":0.0,\"anchorMinN.x\":0.0,\"an"
+    "chorMinN.y\":0.0,\"class\":\"Group\",\"color.a\":255,\"depth\":0.0,\"flowDirecti"
+    "on\":\"NoFlow\",\"flowGridSize.x\":0,\"flowGridSize.y\":0,\"flowMargins.b\":0.0"
+    ",\"flowMargins.l\":68.0,\"flowMargins.r\":400.0,\"flowMargins.t\":0.0,\"flowS"
+    "pacing\":0.0,\"focusable\":0,\"guid\":\"780ba25d863da4448f9d404b2f5d0d68\",\"i"
+    "nheritAlpha\":1,\"inheritRotation\":1,\"inheritScale\":1,\"inheritTint\":1,\"i"
+    "sHoverable\":1,\"isMaskInverted\":0,\"isMaskOrClip\":0,\"layoutMode\":\"Unspec"
+    "ified\",\"locked\":0,\"name\":\"root\",\"noSpawn\":0,\"parent\":null,\"pivotAs.x\":"
+    "0.0,\"pivotAs.y\":0.0,\"pivotN.x\":0.0,\"pivotN.y\":0.0,\"rectSizeDelta.heigh"
+    "t\":160.0,\"rectSizeDelta.width\":0.0,\"resizeDirection\":\"NoResize\",\"rotat"
+    "ion\":0.0,\"scale.x\":1.0,\"scale.y\":1.0,\"tags\":{\"noAnimStateLogic\":\"true\""
+    "},\"tint.blend\":0.0,\"tint.end\":4294967295,\"tint.start\":4294967295,\"visi"
+    "ble\":1},{\"animation\":{\"keyframes\":{\"fcolor.a\":{\"type\":\"float\",\"keys\":["
+    "-0.25],\"values\":[1.0],\"curveTypes\":[null]},\"pivotAs.x\":{\"type\":\"float\""
+    ",\"keys\":[-0.25,0.0,0.5],\"values\":[68.0,50.0,50.0],\"curveTypes\":[null,n"
+    "ull,null]},\"pivotAs.y\":{\"type\":\"float\",\"keys\":[-0.25,0.0,0.5],\"values\""
+    ":[0.0,0.0,0.0],\"curveTypes\":[null,null,null]},\"tint\":{\"type\":\"QColor\","
+    "\"keys\":[-0.25],\"values\":[\"t2-white\"],\"curveTypes\":[null]}}},\"alignH\":0"
+    ",\"alignV\":1,\"anchorMaxN.x\":1.0,\"anchorMaxN.y\":1.0,\"anchorMinN.x\":0.0,\""
+    "anchorMinN.y\":0.0,\"autoSize\":0,\"autoSizeMode\":\"NoAutoSize\",\"cipherId\":"
+    "\"\",\"class\":\"Text\",\"color.a\":255,\"depth\":0.0,\"effect\":\"Regular\",\"faceId"
+    "\":\"Alternate\",\"focusable\":0,\"guid\":\"9615fc6ae430da48bc2f600bbfa46ce4\","
+    "\"inheritAlpha\":1,\"inheritRotation\":1,\"inheritScale\":1,\"inheritTint\":1,"
+    "\"isHoverable\":0,\"isMaskInverted\":0,\"isMaskOrClip\":0,\"layoutMode\":\"Excl"
+    "ude\",\"locked\":1,\"multiline\":1,\"name\":\"label0\",\"noSpawn\":0,\"parent\":\"78"
+    "0ba25d863da4448f9d404b2f5d0d68\",\"pivotAs.x\":50.0,\"pivotAs.y\":0.0,\"pivo"
+    "tN.x\":0.0,\"pivotN.y\":0.5,\"pointSize\":44,\"rectSizeDelta.height\":0.0,\"re"
+    "ctSizeDelta.width\":-1070.0,\"rotation\":0.0,\"scale.x\":1.0,\"scale.y\":1.0,"
+    "\"style\":\"menu-button-smaller\",\"text\":\"Interact\",\"tint.blend\":0.0,\"tint"
+    ".end\":\"t2-white\",\"tint.start\":\"t2-white\",\"tracking.x\":0.0,\"tracking.y\""
+    ":0.0,\"visible\":1},{\"animation\":{\"keyframes\":{\"fcolor.a\":{\"type\":\"float"
+    "\",\"keys\":[1.75],\"values\":[1.0],\"curveTypes\":[null]},\"tint\":{\"type\":\"QC"
+    "olor\",\"keys\":[1.75],\"values\":[4294967295],\"curveTypes\":[null]}}},\"anch"
+    "orMaxN.x\":1.0,\"anchorMaxN.y\":0.5,\"anchorMinN.x\":1.0,\"anchorMinN.y\":0.5"
+    ",\"class\":\"Reference\",\"color.a\":255,\"depth\":1.0,\"focusable\":0,\"guid\":\"0"
+    "7c050f82a48b940a9875c5434573688\",\"inheritAlpha\":1,\"inheritRotation\":1,"
+    "\"inheritScale\":1,\"inheritTint\":0,\"isHoverable\":0,\"isMaskInverted\":0,\"i"
+    "sMaskOrClip\":0,\"layoutMode\":\"Unspecified\",\"locked\":0,\"name\":\"keybindCe"
+    "ll\",\"noSpawn\":0,\"parent\":\"780ba25d863da4448f9d404b2f5d0d68\",\"pivotAs.x"
+    "\":-162.0,\"pivotAs.y\":0.0,\"pivotN.x\":0.5,\"pivotN.y\":0.5,\"rectSizeDelta."
+    "height\":92.0,\"rectSizeDelta.width\":288.0,\"rotation\":0.0,\"scale.x\":1.0,"
+    "\"scale.y\":1.0,\"source\":\"mods/keybind-cell.widget\",\"tint.blend\":0.0,\"ti"
+    "nt.end\":4294967295,\"tint.start\":4294967295,\"visible\":1}]}";
+
+static const char global_keybindCellDocument[] =
+    "{\"size\":[288.0,108.0],\"grid\":[100,100],\"lang\":\"eng\",\"defaultEngineClas"
+    "s\":\"\",\"defaultScript\":\"\",\"fps\":60.0,\"478710ee764acc8e\":0,\"currentFrame"
+    "\":0.0,\"textTracking.x\":0.0,\"textTracking.y\":0.0,\"animation\":{\"labels\":"
+    "[{\"label\":\"disabled\",\"loop\":0,\"range\":[0.5,0.5],\"rate\":1.0,\"revCurve\":"
+    "0},{\"label\":\"hovered\",\"loop\":0,\"range\":[0.25,0.25],\"rate\":1.0,\"revCurv"
+    "e\":0},{\"label\":\"hovered_disabled\",\"loop\":0,\"range\":[0.75,0.75],\"rate\":"
+    "1.0,\"revCurve\":0},{\"label\":\"normal\",\"loop\":0,\"range\":[0.0,0.0],\"rate\":"
+    "1.0,\"revCurve\":0},{\"label\":\"disabled^hovered_disabled\",\"loop\":0,\"range"
+    "\":[0.5,0.75],\"rate\":1.0,\"revCurve\":0},{\"label\":\"hovered^normal\",\"loop\""
+    ":0,\"range\":[0.25,0.0],\"rate\":1.0,\"revCurve\":0},{\"label\":\"hovered_disab"
+    "led^disabled\",\"loop\":0,\"range\":[0.75,0.5],\"rate\":1.0,\"revCurve\":0},{\"l"
+    "abel\":\"normal^hovered\",\"loop\":0,\"range\":[0.0,0.25],\"rate\":1.0,\"revCurv"
+    "e\":0}]},\"items\":[{\"animation\":{\"keyframes\":{}},\"anchorMaxN.x\":0.5,\"anc"
+    "horMaxN.y\":0.5,\"anchorMinN.x\":0.5,\"anchorMinN.y\":0.5,\"class\":\"Group\",\""
+    "color.a\":255,\"depth\":0.0,\"flowDirection\":\"NoFlow\",\"flowGridSize.x\":0,\""
+    "flowGridSize.y\":0,\"flowMargins.b\":0.0,\"flowMargins.l\":0.0,\"flowMargins"
+    ".r\":0.0,\"flowMargins.t\":0.0,\"flowSpacing\":0.0,\"focusable\":0,\"guid\":\"5a"
+    "41ca793a2c3d47b810017f0b86e807\",\"inheritAlpha\":1,\"inheritRotation\":1,\""
+    "inheritScale\":1,\"inheritTint\":0,\"isHoverable\":0,\"isMaskInverted\":0,\"is"
+    "MaskOrClip\":0,\"layoutMode\":\"Unspecified\",\"locked\":0,\"name\":\"root\",\"noS"
+    "pawn\":0,\"parent\":null,\"pivotAs.x\":0.0,\"pivotAs.y\":0.0,\"pivotN.x\":0.5,\""
+    "pivotN.y\":0.5,\"rectSizeDelta.height\":108.0,\"rectSizeDelta.width\":288.0"
+    ",\"resizeDirection\":\"NoResize\",\"rotation\":0.0,\"scale.x\":1.0,\"scale.y\":1"
+    ".0,\"tint.blend\":0.0,\"tint.end\":4294967295,\"tint.start\":4294967295,\"vis"
+    "ible\":1},{\"animation\":{\"keyframes\":{}},\"anchorMaxN.x\":0.5,\"anchorMaxN."
+    "y\":0.5,\"anchorMinN.x\":0.5,\"anchorMinN.y\":0.5,\"class\":\"Reference\",\"colo"
+    "r.a\":255,\"depth\":0.0,\"engineClass\":\"Gui2::Widget\",\"focusable\":1,\"guid\""
+    ":\"7fd322958d8fb746b800f56c1399b92b\",\"inheritAlpha\":1,\"inheritRotation\""
+    ":1,\"inheritScale\":1,\"inheritTint\":0,\"isHoverable\":0,\"isMaskInverted\":0"
+    ",\"isMaskOrClip\":0,\"layoutMode\":\"Unspecified\",\"locked\":0,\"name\":\"column"
+    "ItemRefPrimKbm\",\"noSpawn\":0,\"parent\":\"5a41ca793a2c3d47b810017f0b86e807"
+    "\",\"pivotAs.x\":0.0,\"pivotAs.y\":0.0,\"pivotN.x\":0.5,\"pivotN.y\":0.5,\"rectS"
+    "izeDelta.height\":108.0,\"rectSizeDelta.width\":288.0,\"rotation\":0.0,\"sca"
+    "le.x\":1.0,\"scale.y\":1.0,\"source\":\"menu/list-items/item-button-remap-de"
+    "fault-column-item-pc.widget\",\"tint.blend\":0.0,\"tint.end\":4294967295,\"t"
+    "int.start\":4294967295,\"visible\":1},{\"animation\":{\"keyframes\":{\"fcolor."
+    "a\":{\"type\":\"float\",\"keys\":[0.0,0.25,0.5,0.75],\"values\":[1.0,1.0,1.0,1."
+    "0],\"curveTypes\":[null,null,null,null]},\"tint\":{\"type\":\"QColor\",\"keys\":"
+    "[0.0,0.25,0.5,0.75],\"values\":[\"t2-menu-normal\",\"t2-menu-focused\",\"t2-m"
+    "enu-disabled\",\"t2-menu-focused-disabled\"],\"curveTypes\":[null,null,null"
+    ",null]}}},\"alignH\":1,\"alignV\":1,\"anchorMaxN.x\":1.0,\"anchorMaxN.y\":1.0,"
+    "\"anchorMinN.x\":0.0,\"anchorMinN.y\":0.0,\"autoSize\":0,\"class\":\"Image\",\"co"
+    "lor.a\":255,\"depth\":1.0,\"effect\":\"Regular\",\"explicitSize\":0,\"focusable\""
+    ":0,\"guid\":\"e4a0ab555afc4f498ec602ef95852e2f\",\"inheritAlpha\":1,\"inherit"
+    "Rotation\":1,\"inheritScale\":1,\"inheritTint\":0,\"isHoverable\":0,\"isMaskIn"
+    "verted\":0,\"isMaskOrClip\":0,\"layoutMode\":\"Unspecified\",\"locked\":0,\"name"
+    "\":\"primaryKeyboardIcon\",\"noSpawn\":0,\"parent\":\"5a41ca793a2c3d47b810017f"
+    "0b86e807\",\"path\":\"\",\"pivotAs.x\":0.0,\"pivotAs.y\":0.0,\"pivotN.x\":0.5,\"pi"
+    "votN.y\":0.5,\"rasterSize.height\":0.0,\"rasterSize.width\":0.0,\"rectSizeDe"
+    "lta.height\":0.0,\"rectSizeDelta.width\":0.0,\"rotation\":0.0,\"scale.x\":1.0"
+    ",\"scale.y\":1.0,\"scaleMode\":\"Original\",\"slices\":[0.328125,0.328125,0.32"
+    "8125,0.328125],\"tint.blend\":0.0,\"tint.end\":\"t2-menu-focused\",\"tint.sta"
+    "rt\":\"t2-menu-normal\",\"visible\":1},{\"animation\":{\"keyframes\":{\"fcolor.a"
+    "\":{\"type\":\"float\",\"keys\":[0.0,0.25,0.5,0.75],\"values\":[1.0,1.0,1.0,1.0"
+    "],\"curveTypes\":[null,null,null,null]},\"tint\":{\"type\":\"QColor\",\"keys\":["
+    "0.0,0.25,0.5,0.75],\"values\":[\"t2-menu-normal\",\"t2-menu-focused\",\"t2-me"
+    "nu-disabled\",\"t2-menu-focused-disabled\"],\"curveTypes\":[null,null,null,"
+    "null]}}},\"alignH\":1,\"alignV\":1,\"anchorMaxN.x\":1.0,\"anchorMaxN.y\":1.0,\""
+    "anchorMinN.x\":0.0,\"anchorMinN.y\":0.0,\"autoSize\":0,\"autoSizeMode\":\"NoAu"
+    "toSize\",\"cipherId\":\"\",\"class\":\"Text\",\"color.a\":255,\"depth\":1.0,\"effect"
+    "\":\"Regular\",\"faceId\":\"Alternate\",\"focusable\":0,\"guid\":\"6b0f6c2e1d3a4b5"
+    "c8d9e0f1a2b3c4d5e\",\"inheritAlpha\":1,\"inheritRotation\":1,\"inheritScale\""
+    ":1,\"inheritTint\":0,\"isHoverable\":0,\"isMaskInverted\":0,\"isMaskOrClip\":0"
+    ",\"layoutMode\":\"Unspecified\",\"locked\":0,\"multiline\":0,\"name\":\"keyName\","
+    "\"noSpawn\":0,\"parent\":\"5a41ca793a2c3d47b810017f0b86e807\",\"pivotAs.x\":0."
+    "0,\"pivotAs.y\":0.0,\"pivotN.x\":0.5,\"pivotN.y\":0.5,\"pointSize\":35,\"rectSi"
+    "zeDelta.height\":0.0,\"rectSizeDelta.width\":-20.0,\"rotation\":0.0,\"scale."
+    "x\":1.0,\"scale.y\":1.0,\"text\":\"\",\"tint.blend\":0.0,\"tint.end\":\"t2-menu-fo"
+    "cused\",\"tint.start\":\"t2-menu-normal\",\"tracking.x\":0.0,\"tracking.y\":0.0"
+    ",\"visible\":0},{\"animation\":{\"keyframes\":{}},\"anchorMaxN.x\":0.5,\"anchor"
+    "MaxN.y\":0.5,\"anchorMinN.x\":0.5,\"anchorMinN.y\":0.5,\"capStyle\":\"Flat\",\"c"
+    "lass\":\"Polyline\",\"closed\":1,\"color.a\":255,\"depth\":3.0,\"effect\":\"Regula"
+    "r\",\"focusable\":0,\"guid\":\"d12ee678d79e2a4f82e4e784f4f4370e\",\"inheritAlp"
+    "ha\":1,\"inheritRotation\":1,\"inheritScale\":1,\"inheritTint\":0,\"isHoverabl"
+    "e\":0,\"isMaskInverted\":0,\"isMaskOrClip\":0,\"joinStyle\":\"Miter\",\"layoutMo"
+    "de\":\"Exclude\",\"lineWidth\":2.0,\"locked\":0,\"name\":\"columnItemOutlineUnbo"
+    "undKeyboard\",\"noSpawn\":0,\"parent\":\"5a41ca793a2c3d47b810017f0b86e807\",\""
+    "pivotAs.x\":0.0,\"pivotAs.y\":0.0,\"pivotN.x\":0.5,\"pivotN.y\":0.5,\"pointsUv"
+    "\":[0.0,0.0,0.0,1.0,1.0,1.0,1.0,0.0],\"rectSizeDelta.height\":108.0,\"rect"
+    "SizeDelta.width\":288.0,\"rotation\":0.0,\"scale.x\":1.0,\"scale.y\":1.0,\"tin"
+    "t.blend\":0.0,\"tint.end\":\"t2-pure-red\",\"tint.start\":\"t2-pure-red\",\"visi"
+    "ble\":0},{\"animation\":{\"keyframes\":{}},\"anchorMaxN.x\":0.5,\"anchorMaxN.y"
+    "\":0.5,\"anchorMinN.x\":0.5,\"anchorMinN.y\":0.5,\"class\":\"Reference\",\"color"
+    ".a\":255,\"depth\":4.0,\"focusable\":1,\"guid\":\"cad4c08fe7a99a4086a696260921"
+    "c59b\",\"inheritAlpha\":1,\"inheritRotation\":1,\"inheritScale\":1,\"inheritTi"
+    "nt\":0,\"isHoverable\":0,\"isMaskInverted\":0,\"isMaskOrClip\":0,\"layoutMode\""
+    ":\"Unspecified\",\"locked\":0,\"name\":\"bindingTexts\",\"noSpawn\":0,\"parent\":\""
+    "5a41ca793a2c3d47b810017f0b86e807\",\"pivotAs.x\":0.0,\"pivotAs.y\":0.0,\"piv"
+    "otN.x\":0.5,\"pivotN.y\":0.5,\"rectSizeDelta.height\":108.0,\"rectSizeDelta."
+    "width\":358.0,\"rotation\":0.0,\"scale.x\":1.0,\"scale.y\":1.0,\"source\":\"menu"
+    "/list-items/item-button-remap-default-text-pc.widget\",\"tint.blend\":0.0"
+    ",\"tint.end\":4294967295,\"tint.start\":4294967295,\"visible\":1}]}";
+
+/* One of the keybind row's widget files, put in the table with the pages. */
+static void keepKeybindFile(const char* name, const char* document,
+                            size_t length) {
+    char* text = (char*)malloc(length + 1);
+    if (!text) {
+        writeLog("PAGE no memory for %s, so no keybind row can be drawn", name);
+        return;
+    }
+    memcpy(text, document, length + 1);
+    keepGeneratedPage(name, text, (uint32_t)length);
+}
+
+/* The keybind row's widget files, when a menupage has a keybind. */
+static void generateKeybindRow() {
+    int any = 0;
+    for (int i = 0; i < global_modItemCount && !any; ++i)
+        any = !global_modItems[i].refused
+           && global_modItems[i].controlType == MODPAGE_KEYBIND;
+    if (!any) return;
+    keepKeybindFile(KEYBIND_ROW_NAME, global_keybindRowDocument,
+                    sizeof(global_keybindRowDocument) - 1);
+    keepKeybindFile(KEYBIND_REF_NAME, global_keybindRefDocument,
+                    sizeof(global_keybindRefDocument) - 1);
+    keepKeybindFile(KEYBIND_CELL_NAME, global_keybindCellDocument,
+                    sizeof(global_keybindCellDocument) - 1);
+}
+
 static void generateMenuPages() {
     if (!global_modPageCount) return;
+    generateKeybindRow();
     const MenuFile* fallback = menuFileNamed(PAGE_TEMPLATE_NAME);
     if (!fallback || !fallback->text) {
         writeLog("PAGE %s is not in %s, so no page can be generated",
@@ -2706,6 +3273,9 @@ static void widgetFileRegistrarHook(void* registers, void*) {
 #define KIND_SLIDER             2
 #define KIND_LIST               3
 #define KIND_BUTTON             4
+#define KIND_PRESET             5   /* a selector of presets; keeps no value */
+#define KIND_KEYBIND            6   /* a key, kept as its virtual-key code in
+                                       hexadecimal; its row is a button */
 
 /*
     A setting of ours. The engine's own CreateDataSource builds it as an object
@@ -2787,6 +3357,22 @@ struct OurSetting {
     int      shownAgain;
     int      kind;
     int      index;                    /* which option a row sits on */
+    /* A preset: the store writes its shown option was worked out at, and the
+       preset last chosen, which is asked first, or -1. */
+    LONG     presetSeen;
+    int      presetChosen;
+    /* A keybind: the row its cell was last filled for, the key and the focus
+       it was filled with, and the parts of the cell found there; and whether
+       it may take a key the game binds in its menus, and outside them. */
+    uint64_t keybindRow;
+    int      keybindKey;
+    int      keybindFocus;
+    int      allowMenuKeys;
+    int      allowGameplayKeys;
+    uint64_t keybindIcon;
+    uint64_t keybindName;
+    uint64_t keybindFrame;
+    uint64_t keybindTexts;
     float    value;
     float    asFloat;
     uint64_t titleKeyId;
@@ -2814,9 +3400,11 @@ static int           global_maxFrameworkSources = 6;
 static void giveOurSettingsOwnVtable();
 static volatile LONG global_settingsMade = 0;
 
-/* Whether a setting holds a value, which a list and a button do not. */
+/* Whether a setting holds a value, which a list, a button and a preset do
+   not: a preset shows the preset its settings match. */
 static int holdsValue(const OurSetting* s) {
-    return s->kind != KIND_LIST && s->kind != KIND_BUTTON;
+    return s->kind != KIND_LIST && s->kind != KIND_BUTTON
+        && s->kind != KIND_PRESET;
 }
 
 /* ------------------------------------------------------------- the store */
@@ -2849,9 +3437,14 @@ static void storedText(const char* path, const char* section, const char* key,
     out[last - first] = 0;
 }
 
+/* Counts every write to a store, so a preset works out the preset its
+   settings match only after something may have changed. */
+static volatile LONG global_storeWrites = 0;
+
 static void keepText(const char* path, const char* section, const char* key,
                      const char* value) {
     if (!path || !path[0] || !key || !key[0]) return;
+    InterlockedIncrement(&global_storeWrites);
     if (!WritePrivateProfileStringA(storeSectionOf(section), key, value, path))
         writeLog("STORE %s could not be written to %s, error %lu", key, path,
                  GetLastError());
@@ -3300,8 +3893,33 @@ static int whyLocked(const OurSetting* s) {
     nothing matches. complain writes a line when the text cannot be shown as it
     stands: 1 the first time a value is read, 0 when one is put back.
 */
+/* The Windows virtual-key code a keybind's text names, written in
+   hexadecimal with or without 0x in front (F9 is 0x78); 0 for none. */
+static int keybindKeyOf(const char* text) {
+    if (!text) return 0;
+    const char* at = pastBlanks(text);
+    char* end = 0;
+    const unsigned long key = strtoul(at, &end, 16);
+    if (!end || end == at || *pastBlanks(end)) return 0;
+    return key >= 0x01 && key <= 0xFE ? (int)key : 0;
+}
+
 static void takeValue(OurSetting* s, const char* held, int complain) {
     s->unsaved = 0;
+    if (s->kind == KIND_KEYBIND) {
+        const int key = keybindKeyOf(held);
+        s->mismatch = held[0] && !key;
+        if (s->mismatch && complain)
+            writeLog("STORE \"%s\" holds \"%s\", which is not a key's "
+                     "virtual-key code in hexadecimal: it shows its default "
+                     "until a key is set", s->name, held);
+        const int shown = key ? key : keybindKeyOf(s->fallbackText);
+        s->value = (float)shown;
+        s->asFloat = s->value;
+        s->index = 0;
+        sprintf_s(s->shown, sizeof(s->shown), "0x%02X", shown);
+        return;
+    }
     if (s->kind == KIND_SLIDER) {
         s->value = held[0] ? (float)atof(held) : s->fallback;
         s->mismatch = held[0] && (s->value < s->least || s->value > s->greatest);
@@ -4071,7 +4689,7 @@ static void dressLockedText(const char* text, char* out, size_t size) {
         name(value, ...)            a formula the file's header defines
 
     OPTION stands for the option being labelled in a SelectorLabel, counted
-    from 1.
+    from 1. VALUE stands for the slider's value in a SliderValueText.
 
     A condition is the same language ControlDependency is written in - the
     comparisons =, !=, <, >, <= and >=, the words AND, NAND, OR, NOR, XOR,
@@ -4137,6 +4755,8 @@ struct ExpressionScope {
     page        the menupage whose formulas can be called, -1 for none
     option      the option a SelectorLabel is being worked out for, counted
                 from 1, 0 where there is none
+    hasValue    VALUE has a value: the slider's value a SliderValueText is
+    value       being worked out for
     scope       the names in force; scopeLimit is how many of its own count,
                 since a LET value reads only the names before its own
 */
@@ -4146,6 +4766,8 @@ struct ExpressionCursor {
     const OurSetting* owner;
     int               page;
     int               option;
+    int               hasValue;
+    double            value;
     ExpressionScope*  scope;
     int               scopeLimit;
     int               depth;
@@ -4714,6 +5336,11 @@ static void primaryValue(ExpressionCursor* c, ExpressionValue* out) {
         else expressionFault(c, "OPTION has a value only in a SelectorLabel", 0);
         return;
     }
+    if (expressionWordAt(c, "VALUE")) {
+        if (c->hasValue) valueFromNumber(out, c->value);
+        else expressionFault(c, "VALUE has a value only in a SliderValueText", 0);
+        return;
+    }
 
     int wasFunction = 0;
     expressionFunction(c, out, &wasFunction);
@@ -4899,6 +5526,7 @@ static const char* nameOfOwner(const OurSetting* owner) {
     text      the expression, as the menupage wrote it
     owner     the control it was written on, or nothing
     option    what OPTION stands for, 0 for nothing
+    value     what VALUE stands for, or nothing
     answer    receives what it came to
     read      receives the controls the expression read, or nothing
     readCount receives how many, or nothing
@@ -4907,9 +5535,9 @@ static const char* nameOfOwner(const OurSetting* owner) {
     Answers 1 where it was worked out, 0 where it was not, which is written to
     the log and is what IFERROR answers to.
 */
-static int evaluateValue(const char* text, const OurSetting* owner, int option,
-                         ExpressionValue* answer, const OurSetting** read,
-                         int* readCount, int readRoom) {
+static int evaluateWith(const char* text, const OurSetting* owner, int option,
+                        const double* value, ExpressionValue* answer,
+                        const OurSetting** read, int* readCount, int readRoom) {
     ExpressionCursor c;
     c.at = text;
     c.end = text + strlen(text);
@@ -4917,6 +5545,8 @@ static int evaluateValue(const char* text, const OurSetting* owner, int option,
     c.page = owner && owner->modItem >= 0 ? global_modItems[owner->modItem].file
                                           : -1;
     c.option = option;
+    c.hasValue = value != 0;
+    c.value = value ? *value : 0.0;
     c.scope = 0;
     c.scopeLimit = 0;
     c.depth = 0;
@@ -4942,6 +5572,13 @@ static int evaluateValue(const char* text, const OurSetting* owner, int option,
         *readCount = at;
     }
     return 1;
+}
+
+static int evaluateValue(const char* text, const OurSetting* owner, int option,
+                         ExpressionValue* answer, const OurSetting** read,
+                         int* readCount, int readRoom) {
+    return evaluateWith(text, owner, option, 0, answer, read, readCount,
+                        readRoom);
 }
 
 static int evaluateExpression(const char* text, const OurSetting* owner,
@@ -5130,6 +5767,33 @@ static void refreshOptionLabel(OurSetting* s, int at) {
     copyBounded(s->option[at], sizeof(s->option[at]), worked, "option");
 }
 
+/*
+    The text a slider shows for its value where SliderValueText gives one: the
+    expression worked out with VALUE standing for the value, so
+    IF(VALUE > 30, "Persistent", VALUE) shows Persistent at 31 and the number
+    below it. Answers 0 where the slider has none, or it could not be worked
+    out or holds text the engine cannot draw, and the number is then shown.
+*/
+static int sliderValueText(const OurSetting* s, char* out, size_t room) {
+    if (!s || s->modItem < 0 || s->kind != KIND_SLIDER) return 0;
+    const ModPageItem* item = &global_modItems[s->modItem];
+    if (!item->valueText[0]) return 0;
+    const double value = (double)s->value;
+    ExpressionValue answer;
+    if (!evaluateWith(item->valueText, s, 0, &value, &answer, 0, 0, 0))
+        return 0;
+    char worked[EXPRESSION_TEXT];
+    valueText(&answer, worked, sizeof(worked), "a slider's value text");
+    if (!worked[0] || fatalPipeAt(worked) >= 0 || fatalTagAt(worked) >= 0) {
+        expressionLine("EXPRESSION the value text of %s came to \"%s\", which "
+                       "is empty or holds text the engine cannot draw, so the "
+                       "number is shown", s->name, worked);
+        return 0;
+    }
+    copyBounded(out, room, worked, "a slider's value text");
+    return 1;
+}
+
 /* Whether ControlVisibility hides the control now. */
 static int controlIsHidden(const OurSetting* s) {
     if (!s || s->modItem < 0 || s->kind == KIND_BUTTON) return 0;
@@ -5254,6 +5918,91 @@ static void settleAfterChange(const OurSetting* changing) {
         }
         if (redraw) refreshControl(s);
     }
+}
+
+/* ------------------------------------------------------------- presets */
+
+/*
+    What a setting a preset names holds for the player now, into out: a
+    control's value, or while the control is locked the value it goes back to
+    when it unlocks; or the text of a settings file key no control reads.
+    Answers the control, or nothing.
+*/
+static OurSetting* presetHeld(const OurSetting* preset, const char* name,
+                              char* out, size_t room) {
+    char whole[MODPAGE_NAME * 2], section[MODPAGE_NAME];
+    copyBounded(whole, sizeof(whole), name, "a preset's setting");
+    const char* key = splitSettingName(whole, 1, preset, section,
+                                       sizeof(section), "a preset's section");
+    OurSetting* s = settingNamed(preset->storePath, section, key);
+    out[0] = 0;
+    if (!s) {
+        storedText(preset->storePath, section, key, "", out, room);
+        return 0;
+    }
+    if (s->locked != LOCKED_BY_NOTHING && global_settingsCachePath[0]) {
+        CacheNames names;
+        cacheNames(s, s->storeKey, &names);
+        storedText(global_settingsCachePath, names.section, names.storedKey, "",
+                   out, room);
+        if (out[0]) return s;
+    }
+    if (s->kind == KIND_SLIDER) writeNumber(out, room, s->value);
+    else if (s->index >= 0 && s->index < s->optionCount)
+        copyBounded(out, room, s->optionValue[s->index], "a preset's setting");
+    else storedText(s->storePath, s->storeSection, s->storeKey, "", out, room);
+    return s;
+}
+
+/* Two numbers compare as numbers and anything else as text, ignoring case. */
+static int presetValuesMatch(const char* held, const char* wanted) {
+    char* past = 0;
+    const double a = strtod(held, &past);
+    const int heldIsNumber = past && past != held && !*pastBlanks(past);
+    const double b = strtod(wanted, &past);
+    const int wantedIsNumber = past && past != wanted && !*pastBlanks(past);
+    if (heldIsNumber && wantedIsNumber) return sameNumber((float)a, (float)b);
+    return _stricmp(held, wanted) == 0;
+}
+
+/* Whether every setting preset p of s sets holds the preset's value. */
+static int presetHolds(const OurSetting* s, int p) {
+    const Preset* preset = &global_preset[global_modItems[s->modItem].firstPreset
+                                          + p];
+    for (int k = 0; k < preset->count; ++k) {
+        char held[MAX_SETTING_TEXT];
+        presetHeld(s, preset->setting[k].name, held, sizeof(held));
+        if (!presetValuesMatch(held, preset->setting[k].value)) return 0;
+    }
+    return 1;
+}
+
+/* The option a preset shows: the preset last chosen where it still holds,
+   else the first that holds, else the last option, for settings that match
+   none. */
+static int presetMatch(const OurSetting* s) {
+    const int presets = s->optionCount - 1;
+    if (s->modItem < 0 || presets <= 0) return 0;
+    if (s->presetChosen >= 0 && s->presetChosen < presets
+        && presetHolds(s, s->presetChosen))
+        return s->presetChosen;
+    for (int p = 0; p < presets; ++p)
+        if (presetHolds(s, p)) return p;
+    return presets;
+}
+
+/* A preset's shown option, worked out again where the store has been written
+   since it last was. */
+static void presetFollow(OurSetting* s) {
+    if (!s || s->kind != KIND_PRESET) return;
+    const LONG writes = global_storeWrites;
+    if (s->presetSeen == writes) return;
+    s->presetSeen = writes;
+    const int at = presetMatch(s);
+    s->index = at;
+    s->value = (float)at;
+    s->asFloat = s->value;
+    copyBounded(s->shown, sizeof(s->shown), s->optionValue[at], "a preset");
 }
 
 /* The next setting of ours, empty, with nothing it belongs to. The caller
@@ -5391,7 +6140,17 @@ static void makeSettingsFromModPages() {
 
             s->kind = item->controlType == MODPAGE_SLIDER   ? KIND_SLIDER
                     : item->controlType == MODPAGE_SELECTOR ? KIND_SELECTOR
+                    : item->controlType == MODPAGE_PRESET   ? KIND_PRESET
+                    : item->controlType == MODPAGE_KEYBIND  ? KIND_KEYBIND
                                                             : KIND_TOGGLE;
+            /* A preset keeps nothing in the store: it shows the preset its
+               settings match, worked out when first asked. */
+            if (s->kind == KIND_PRESET) {
+                s->storeKey[0] = 0;
+                s->keyExpression[0] = 0;
+                s->presetSeen = -1;
+                s->presetChosen = -1;
+            }
             strcpy_s(s->className, sizeof(s->className),
                      s->kind == KIND_SLIDER ? SLIDER_CLASS : SELECTOR_CLASS);
             s->least = item->least;
@@ -5420,6 +6179,18 @@ static void makeSettingsFromModPages() {
                     s->optionCapacity = MAX_OPTIONS;
                 }
                 s->optionCount = s->optionCapacity;
+            }
+            /* A keybind offers one option, which no row draws: what the engine
+               asks of a selector is answered without it. */
+            if (s->kind == KIND_KEYBIND) {
+                s->optionCount = s->optionCapacity = 1;
+                strcpy_s(s->option[0], sizeof(s->option[0]), "Key");
+                copyBounded(s->optionValue[0], sizeof(s->optionValue[0]),
+                            s->fallbackText, "option value");
+                s->keybindKey = -1;
+                s->keybindFocus = -1;
+                s->allowMenuKeys = item->allowMenuKeys;
+                s->allowGameplayKeys = item->allowGameplayKeys;
             }
             /* fallbackText, not the block's own field, which still holds the
                expression where the default is written as one.
@@ -6030,7 +6801,9 @@ static void ourGetFieldConfig(uint64_t source, uint64_t config, uint64_t) {
         widgets[0] = global_labelWidgetId;
         values[0]  = global_valueId;
         per[0]     = 1;
-        if (!s || s->kind != KIND_BUTTON) {
+        /* A keybind's row is a button: its cell is filled by the framework
+           itself (keybindTick). */
+        if (!s || (s->kind != KIND_BUTTON && s->kind != KIND_KEYBIND)) {
             widgets[1] = global_textWidgetId;
             values[1]  = global_valueId;
             per[1]     = 1;
@@ -6164,6 +6937,7 @@ static uint64_t ourGetItemData(uint64_t source, uint64_t index,
     OurSetting* s = ourSourceByObject(source);
     if (!s) return 0;
     refreshExpressions(s);
+    presetFollow(s);
 
     const int which = (int)(s - &global_ourSources[0]);
     if (which < 0 || which >= MAX_FRAMEWORK_SOURCES) return 0;
@@ -6174,10 +6948,14 @@ static uint64_t ourGetItemData(uint64_t source, uint64_t index,
 
     const int at = (int)(int32_t)(uint32_t)index;
     if (at < 0) return 0;
-    if (s->kind == KIND_BUTTON) {
+    if (s->kind == KIND_BUTTON || s->kind == KIND_KEYBIND) {
         if (at > 0) return 0;
         ItemData* b = &global_itemData[which][0];
-        strcpy_s(b->title, sizeof(b->title), s->title);
+        /* A keybind carries the bullet a changed setting carries. */
+        if (s->kind == KIND_BUTTON || settingIsAtDefault(s))
+            strcpy_s(b->title, sizeof(b->title), s->title);
+        else
+            sprintf_s(b->title, "\xe2\x80\xa2 %s", s->title);
         boxString(&b->value[0], b->title);
         return boxItems(b, 1);
     }
@@ -6189,7 +6967,7 @@ static uint64_t ourGetItemData(uint64_t source, uint64_t index,
            stands until the control is used. */
         if (s->mismatch && !s->touched)
             strcpy_s(d->text, sizeof(d->text), s->shown);
-        else
+        else if (!sliderValueText(s, d->text, sizeof(d->text)))
             writeNumber(d->text, sizeof(d->text), s->value);
     } else {
         refreshOptionLabel(s, at);
@@ -6243,6 +7021,7 @@ static void ourGetValueRange(uint64_t source, uint64_t least, uint64_t greatest,
     OurSetting* s = ourSourceByObject(source);
     if (!s) return;
     refreshExpressions(s);
+    presetFollow(s);
     GUARD_TRY {
         if (s->kind == KIND_SLIDER && s->logarithmic) {
             const int positions = positionsOf(s);
@@ -6285,6 +7064,7 @@ static uint64_t ourGetValuePtr(uint64_t source, uint64_t) {
     OurSetting* s = ourSourceByObject(source);
     if (!s) return 0;
     refreshExpressions(s);
+    presetFollow(s);
     return (uint64_t)&s->index;
 }
 
@@ -6327,13 +7107,18 @@ static uint64_t ourGetDescriptionTextId(uint64_t source, uint64_t out,
 static int settingIsAtDefault(const OurSetting* s) {
     if (!s->markAsModified || s->kind == KIND_BUTTON) return 1;
     if (s->kind == KIND_SLIDER) return sameNumber(s->value, s->fallback);
+    /* A preset with no DefaultValue has no default to differ from. */
+    if (s->kind == KIND_PRESET && !s->fallbackText[0]) return 1;
+    if (s->kind == KIND_KEYBIND)
+        return (int)s->value == keybindKeyOf(s->fallbackText);
     if (s->index >= 0 && s->index < s->optionCount)
         return _stricmp(s->optionValue[s->index], s->fallbackText) == 0;
     return 1;
 }
 
 static uint8_t ourIsAtDefault(uint64_t source, uint64_t, uint64_t) {
-    const OurSetting* s = ourSourceByObject(source);
+    OurSetting* s = ourSourceByObject(source);
+    presetFollow(s);
     return (uint8_t)(!s || settingIsAtDefault(s) ? 1 : 0);
 }
 
@@ -6431,6 +7216,136 @@ static void followRowPosition(const OurSetting* s) {
 }
 
 /*
+    One setting a preset names, given value. A control takes it as if it had
+    been chosen on its row, and is drawn again; a locked control takes it as
+    the value it goes back to when it unlocks; a settings file key no control
+    reads is written as it is.
+*/
+static void presetSet(const OurSetting* preset, const char* name,
+                      const char* value) {
+    char whole[MODPAGE_NAME * 2], section[MODPAGE_NAME];
+    copyBounded(whole, sizeof(whole), name, "a preset's setting");
+    const char* key = splitSettingName(whole, 1, preset, section,
+                                       sizeof(section), "a preset's section");
+    OurSetting* t = settingNamed(preset->storePath, section, key);
+    if (!t) {
+        keepText(preset->storePath, section, key, value);
+        return;
+    }
+    if (!holdsValue(t)) return;
+    if (t->locked != LOCKED_BY_NOTHING && global_settingsCachePath[0]) {
+        CacheNames names;
+        cacheNames(t, t->storeKey, &names);
+        char stored[MAX_SETTING_TEXT];
+        storedText(global_settingsCachePath, names.section, names.storedKey, "",
+                   stored, sizeof(stored));
+        if (stored[0]) {
+            keepText(global_settingsCachePath, names.section, names.storedKey,
+                     value);
+            return;
+        }
+    }
+    takeValue(t, value, 1);
+    t->touched = 1;
+    keepText(t->storePath, t->storeSection, t->storeKey, value);
+    if (t->listOwner >= 0) composeList(t->listOwner);
+    followRowPosition(t);
+    t->rangeMoved = 1;   /* its row is drawn again */
+}
+
+/* Every setting any preset of s names, once each, in the order first named. */
+static int presetNames(const OurSetting* s, const char** out, int room) {
+    const ModPageItem* item = &global_modItems[s->modItem];
+    int count = 0;
+    for (int p = 0; p < s->optionCount - 1; ++p) {
+        const Preset* preset = &global_preset[item->firstPreset + p];
+        for (int k = 0; k < preset->count && count < room; ++k) {
+            int seen = 0;
+            for (int n = 0; n < count && !seen; ++n)
+                seen = !_stricmp(out[n], preset->setting[k].name);
+            if (!seen) out[count++] = preset->setting[k].name;
+        }
+    }
+    return count;
+}
+
+/* Where the values a preset puts aside are kept: the settings cache, in the
+   mod's own section, under the preset's name. */
+static void presetAsideKey(const OurSetting* s, const char* name,
+                           CacheNames* names, char* key, size_t room) {
+    cacheNames(s, "custom", names);
+    if (name) sprintf_s(key, room, "%s.custom.%s", s->name, name);
+    else sprintf_s(key, room, "%s.custom", s->name);
+}
+
+/* What every setting the presets name holds, put aside before a preset is
+   chosen over settings that match none. */
+static void presetPutAside(const OurSetting* s) {
+    if (!global_settingsCachePath[0]) return;
+    const char* name[MAX_PRESET_NAMES];
+    const int count = presetNames(s, name, MAX_PRESET_NAMES);
+    CacheNames names;
+    char key[MODPAGE_NAME * 4];
+    for (int n = 0; n < count; ++n) {
+        char held[MAX_SETTING_TEXT];
+        presetHeld(s, name[n], held, sizeof(held));
+        presetAsideKey(s, name[n], &names, key, sizeof(key));
+        keepText(global_settingsCachePath, names.section, key, held);
+    }
+    presetAsideKey(s, 0, &names, key, sizeof(key));
+    keepText(global_settingsCachePath, names.section, key, "1");
+}
+
+/* The values put aside, put back. Nothing where none were. */
+static void presetPutBack(const OurSetting* s) {
+    if (!global_settingsCachePath[0]) return;
+    CacheNames names;
+    char key[MODPAGE_NAME * 4], held[MAX_SETTING_TEXT];
+    presetAsideKey(s, 0, &names, key, sizeof(key));
+    storedText(global_settingsCachePath, names.section, key, "", held,
+               sizeof(held));
+    if (!held[0]) return;
+    const char* name[MAX_PRESET_NAMES];
+    const int count = presetNames(s, name, MAX_PRESET_NAMES);
+    for (int n = 0; n < count; ++n) {
+        presetAsideKey(s, name[n], &names, key, sizeof(key));
+        storedText(global_settingsCachePath, names.section, key, "", held,
+                   sizeof(held));
+        if (held[0]) presetSet(s, name[n], held);
+    }
+}
+
+/*
+    A preset's option chosen on its row: a preset's settings are set, the
+    values put aside first where the settings matched no preset; the last
+    option puts those values back. Everything that follows from the changes
+    is settled as after any change. Answers whether anything was chosen.
+*/
+static uint64_t presetChoose(OurSetting* s, int now) {
+    presetFollow(s);
+    const int presets = s->optionCount - 1;
+    if (now < 0) now = 0;
+    if (now > presets) now = presets;
+    if (now == s->index) return 0;
+    if (now < presets) {
+        if (s->index == presets) presetPutAside(s);
+        const Preset* preset = &global_preset[global_modItems[s->modItem]
+                                                  .firstPreset + now];
+        for (int k = 0; k < preset->count; ++k)
+            presetSet(s, preset->setting[k].name, preset->setting[k].value);
+        s->presetChosen = now;
+    } else {
+        presetPutBack(s);
+        s->presetChosen = -1;
+    }
+    s->touched = 1;
+    s->presetSeen = -1;
+    settleAfterChange(s);
+    presetFollow(s);
+    return 1;
+}
+
+/*
     SetItemValue(int index, const BoxedValue* value, ...). Answers whether the
     value moved. The engine calls this once a frame for as long as a slider is
     being dragged.
@@ -6441,8 +7356,10 @@ static void followRowPosition(const OurSetting* s) {
 static uint64_t ourSetItemValue(uint64_t source, uint64_t value, uint64_t a2,
                                 uint64_t) {
     OurSetting* s = ourSourceByObject(source);
-    if (!s || s->kind == KIND_BUTTON) return 0;
+    if (!s || s->kind == KIND_BUTTON || s->kind == KIND_KEYBIND) return 0;
     refreshExpressions(s);
+    if (s->kind == KIND_PRESET)
+        return presetChoose(s, (int)(int32_t)(uint32_t)value);
 
     char keeps[MAX_SETTING_TEXT];
     if (s->kind == KIND_SLIDER) {
@@ -6541,6 +7458,826 @@ static void giveOurSettingsOwnVtable() {
             writeLog("SETTING \"%s\" could not be given a table of its own",
                      s->name);
     }
+}
+
+/* ------------------------------------------------------------- keybinds */
+
+/*
+    A keybind control: a key a mod reads, kept in its settings file as the
+    key's Windows virtual-key code in hexadecimal (F9 is 0x78), and set the
+    way the game's own Customise Controls page sets one. Its row is the game's
+    keybind row rebuilt with one cell (keybindRowDocument).
+
+    The framework plays what the game's page plays on its rows:
+
+      - While the row has focus its cell is hovered (the game's
+        Menu2::RemapColumnItems plays the state on the cell and on its frame,
+        01C49244), and the mouse cursor shows the keyboard (the menu root's
+        mouse-cursor, the file hud/pc-cursor, played keyboard by 01C93978, as
+        01C4B49C does for a keyboard column); focus leaving puts the cursor
+        back to normal. A locked control's cell is disabled.
+      - Choosing the row makes the button send an event to its page through
+        02660DA0, which the framework hears there, and the row waits for a key
+        (01C49340): the row is secondary_focused, the cell's binding texts show
+        the instruction (focused), the page ignores its own input (its +0x920
+        bit 3, as the game's page sets it), and sfx-open plays. Every frame
+        while it waits, the menu's commands are turned aside to their -vc names
+        (0202DC00), as the game's page turns them, so the keyboard does not
+        move or close the menu.
+      - A key held past KEYBIND_HOLD_SECONDS shows the binding texts' binding
+        state, the old key's icon, the arrow and the new key's icon, plays
+        sfx-menu-new-button-assign-hold, and fills the bar over
+        KEYBIND_FILL_SECONDS, set each frame as the game's page sets it
+        (01C47478, 01C47CF8). Let go first, the hold sound is ended,
+        sfx-menu-new-button-assign-cancel plays, the bar runs back to empty at
+        the game's pace (01C47A38), and the wait goes on. A full bar sets the
+        key, written to the settings file, and plays
+        sfx-menu-new-button-assign-complete (01C3FDD0).
+      - A key the game's own controls bind where the keybind does not allow
+        it (keybindBoundInGame) is refused: sfx-menu-error plays as it goes
+        down, the game's sound for a choice that cannot be made, and it is
+        passed over until it is let go. The menupage's KeybindAllowMenuKeys
+        (True unless it says False) allows keys the game binds to its menu
+        actions, and KeybindAllowGameplayKeys (False unless it says True)
+        keys it binds to any other action.
+      - Esc, focus leaving the row, or the row locking ends the wait with
+        sfx-back. The binding texts go back to normal, the row to focused (or
+        normal), and the page takes its input again.
+
+    Keys that are not taken: the mouse buttons, Esc, the Windows keys, Shift,
+    Ctrl and Alt as one key (their left and right keys are taken unless the
+    game binds them), and the keys the game's controls bind where the keybind
+    does not allow them (by default, those bound outside its menus).
+
+    Every address here is tlou-i.exe 1.1.5.0's; on another build a keybind
+    row shows its title alone and cannot be set.
+*/
+#define KEYBIND_BUILD_STAMP      0x685BEBE1u
+#define SEND_EVENT_RVA           0x02660DA0ull  /* (component, event, ...) */
+#define FIND_CHILD_RVA           0x025482C8ull  /* (widget, name, 0) -> the widget of that name below it */
+#define PLAY_LABEL_RVA           0x0254AD24ull  /* (widget, label, ...) plays an animation label */
+#define PAGE_OF_RVA              0x0254A274ull  /* (widget) -> the page it is on */
+#define PAGE_FLAGS               0x920          /* a page's flags; bit 3: it ignores its input */
+#define PAGE_IGNORES_INPUT       0x08
+#define INPUT_OF_RVA             0x02662094ull  /* (component) -> the input its page reads */
+#define TURN_COMMAND_RVA         0x0202DC00ull  /* (input, command, as), for the next frame */
+#define AS_PROGRESS_BAR_RVA      0x025FEB64ull  /* (widget) -> it as an IProgressBar, or 0 */
+#define KEY_ICON_TEXT_RVA        0x020E0EE4ull  /* writes a key's icon as text into a builder */
+#define ICON_BUILDER_TYPE_RVA    0x02C79208ull  /* that builder's class */
+#define KEYBOARD_STATE_RVA       0x07FE7E00ull  /* the frame's copy of GetKeyboardState */
+#define MENU_OBJECT_RVA          0x023712A4ull  /* () -> the object the menu root is */
+#define AS_MENU_ROOT_RVA         0x01C8A3B8ull  /* (object) -> it as Menu2::RootGame, or 0 */
+#define MENU_ROOT_CHANGED        0x7D0          /* byte the game's menus set after a change */
+#define PLAY_CURSOR_RVA          0x01C93978ull  /* (menu root, label) plays the mouse cursor's state */
+#define SFX_SPAWN_INFO_RVA       0x024FEBC4ull  /* (info, sound, 0, &zero) a sound's spawn info */
+#define SPAWN_PROCESS_RVA        0x01FB367Cull  /* Process::SpawnProcess(info, 0) */
+#define KILL_TREE_RVA            0x01EF9270ull  /* Process::KillTree(process) */
+#define PROCESS_MANAGER_RVA      0x06433198ull  /* -> the process manager */
+#define PROCESSES_KILLABLE       0x60           /* its byte: processes may be killed now */
+#define SFX_SPAWN_INFO_BYTES     0x320
+#define PROGRESS_SHOW_SLOT       0x318          /* (bar, shown) */
+#define PROGRESS_SET_SLOT        0x3F8          /* (bar, fraction, seconds, curve, 0) */
+#define PROGRESS_EASE_RVA        0x025FF9B8ull  /* (bar, fraction, per second, curve, least seconds) */
+#define PROGRESS_CURVE           0x0C           /* the curve the game's page fills its bar by */
+#define CONTROL_SCHEMES_RVA      0x080DE940ull  /* -> the game's control schemes */
+#define CONTROL_SCHEME_IN_USE_RVA 0x080DE948ull /* the index of the scheme in use */
+#define CONTROL_SCHEME_COUNT_RVA 0x080DE94Cull  /* how many schemes there are */
+#define CONTROL_SCHEME_BYTES     5000
+#define SCHEME_KEYBOARD_MAP      0xD10          /* a scheme's keyboard bindings: the entries, */
+#define SCHEME_MAP_COUNT         0x10           /* and how many, after them */
+#define SCHEME_MAP_MOST          4096
+#define WIDGET_SET_PROPERTY_SLOT 0x380
+#define BOXED_BOOL_TYPE          1
+#define KEYBIND_HOLD_SECONDS     0.3
+#define KEYBIND_FILL_SECONDS     1.5
+#define KEYBIND_ESCAPE           0x1B
+
+typedef uint64_t (*FindChildFn)(uint64_t, const char*, int);
+typedef void (*PlayLabelFn)(uint64_t, uint64_t, uint64_t, uint64_t, uint64_t,
+                            uint64_t, float, float);
+typedef uint64_t (*PageOfFn)(uint64_t);
+typedef uint64_t (*InputOfFn)(uint64_t);
+typedef void (*TurnCommandFn)(uint64_t, uint64_t, uint64_t);
+typedef uint64_t (*AsProgressBarFn)(uint64_t);
+typedef void (*ProgressShowFn)(uint64_t, uint8_t);
+/* The fraction and the seconds to take over it are floats (xmm1, xmm2), the
+   curve a byte (r9b), as 01C47CF8 and 025FF9B8 call it; 0 seconds sets the
+   fraction at once. */
+typedef void (*ProgressSetFn)(uint64_t, float, float, uint8_t, uint8_t);
+typedef void (*ProgressEaseFn)(uint64_t, float, float, uint8_t, float);
+typedef void (*SetPropertyFn)(uint64_t, uint64_t, const BoxedValue*);
+typedef uint64_t (*MenuObjectFn)(void);
+typedef uint64_t (*AsMenuRootFn)(uint64_t);
+typedef void (*PlayCursorFn)(uint64_t, uint64_t);
+typedef uint64_t (*SfxSpawnInfoFn)(void*, uint64_t, uint64_t, uint64_t*);
+typedef uint64_t (*SpawnProcessFn)(void*, uint64_t);
+typedef void (*KillTreeFn)(uint64_t);
+
+/* The text builder 020E1020 makes on its stack for 020E0EE4: its class, its
+   capacity (256), the length written, and the text. */
+struct IconBuilder {
+    uint64_t type;
+    uint64_t capacity;
+    uint64_t length;
+    char     text[0x108];
+};
+typedef void (*KeyIconTextFn)(uint64_t, IconBuilder*, uint64_t);
+
+/* The game's key code for each Windows key, 0 where it has none. */
+static const uint8_t global_gameCodeOfKey[256] = {
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0xAB, 0x8F, 0, 0, 0, 0x99, 0, 0,
+    0, 0, 0, 0xA9, 0, 0, 0, 0,
+    0, 0, 0, 0x9C, 0, 0, 0, 0,
+    0x20, 0xAD, 0xAE, 0xB0, 0xAF, 0xB1, 0xB3, 0xB2,
+    0xB4, 0, 0, 0, 0, 0xAC, 0xAA, 0,
+    0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+    0x38, 0x39, 0, 0, 0, 0, 0, 0,
+    0, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47,
+    0x48, 0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F,
+    0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57,
+    0x58, 0x59, 0x5A, 0, 0, 0, 0, 0,
+    0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
+    0x88, 0x89, 0x8C, 0x8A, 0, 0x8B, 0x8E, 0x8D,
+    0x9D, 0x9E, 0x9F, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4,
+    0xA5, 0xA6, 0xA7, 0xA8, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0x90, 0x91, 0x93, 0x94, 0x96, 0x97, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0x3B, 0x3D, 0x2C, 0x2D, 0x2E, 0x2F,
+    0x60, 0xB7, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0x5B, 0x5C, 0x5D, 0x27, 0xB8,
+    0, 0, 0xB9, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0,
+};
+
+/* A Windows key, by the name on it, for a key the game has no icon for. */
+static const char* keyNameOf(int key, char* out, size_t size) {
+    static const struct { int key; const char* name; } named[] = {
+        { 0x08, "Backspace" }, { 0x09, "Tab" }, { 0x0D, "Enter" },
+        { 0x13, "Pause" }, { 0x14, "Caps Lock" }, { 0x20, "Space" },
+        { 0x21, "Page Up" }, { 0x22, "Page Down" }, { 0x23, "End" },
+        { 0x24, "Home" }, { 0x25, "Left" }, { 0x26, "Up" }, { 0x27, "Right" },
+        { 0x28, "Down" }, { 0x2C, "Print Screen" }, { 0x2D, "Insert" },
+        { 0x2E, "Delete" }, { 0x5D, "Menu" }, { 0x6A, "Num *" },
+        { 0x6B, "Num +" }, { 0x6D, "Num -" }, { 0x6E, "Num ." },
+        { 0x6F, "Num /" }, { 0x90, "Num Lock" }, { 0x91, "Scroll Lock" },
+        { 0xA0, "Left Shift" }, { 0xA1, "Right Shift" }, { 0xA2, "Left Ctrl" },
+        { 0xA3, "Right Ctrl" }, { 0xA4, "Left Alt" }, { 0xA5, "Right Alt" },
+        { 0xBA, ";" }, { 0xBB, "=" }, { 0xBC, "," }, { 0xBD, "-" },
+        { 0xBE, "." }, { 0xBF, "/" }, { 0xC0, "`" }, { 0xDB, "[" },
+        { 0xDC, "\\" }, { 0xDD, "]" }, { 0xDE, "'" },
+    };
+    for (size_t i = 0; i < sizeof(named) / sizeof(named[0]); ++i)
+        if (named[i].key == key) {
+            strncpy_s(out, size, named[i].name, _TRUNCATE);
+            return out;
+        }
+    if ((key >= 0x30 && key <= 0x39) || (key >= 0x41 && key <= 0x5A))
+        sprintf_s(out, size, "%c", key);
+    else if (key >= 0x60 && key <= 0x69)
+        sprintf_s(out, size, "Num %d", key - 0x60);
+    else if (key >= 0x70 && key <= 0x87)
+        sprintf_s(out, size, "F%d", key - 0x6F);
+    else
+        sprintf_s(out, size, "Key %02X", key);
+    return out;
+}
+
+/* Whether a key can be taken as a keybind. */
+static int keybindTakes(int key) {
+    if (key <= 0x06 || key == KEYBIND_ESCAPE || key >= 0xFF) return 0;
+    if (key >= 0x10 && key <= 0x12) return 0;   /* Shift, Ctrl, Alt as one */
+    if (key == 0x5B || key == 0x5C) return 0;   /* the Windows keys */
+    return 1;
+}
+
+/*
+    One wait for a key at a time: the keybind waiting (its place in
+    global_ourSources, -1 for none), the key held and since when, whether the
+    progress is shown, the hold sound's handle, the handle of the page told to
+    ignore its input, and the keys that were down when the wait began, which
+    are not taken until they are let go.
+*/
+struct KeybindWait {
+    int       setting;
+    int       holding;
+    ULONGLONG heldSince;
+    int       progressShown;
+    uint64_t  holdSoundRecord;
+    uint32_t  holdSoundId;
+    uint64_t  pageRecord;
+    uint32_t  pageId;
+    uint8_t   ignored[32];
+};
+
+static int           global_keybindsKnown = 0;   /* the build the addresses are for */
+static volatile LONG global_keybindAsked = -1;   /* a keybind chosen on its row */
+static KeybindWait   global_keybindWait = { -1, 0, 0, 0, 0, 0, 0, 0, { 0 } };
+static int           global_keybindCursor = 0;   /* the cursor shows the keyboard for us */
+static char          global_keyIconPath[256][96];  /* each key's icon, kept alive */
+static uint8_t       global_keyIconAsked[256];
+static char          global_keyNameText[256][24];  /* each key's name, kept alive */
+
+static int keyHeldNow(int key) {
+    unsigned char state = 0;
+    if (key <= 0 || key > 0xFF) return 0;
+    GUARD_TRY {
+        state = *(const volatile unsigned char*)(global_moduleBase
+                                                 + KEYBOARD_STATE_RVA
+                                                 + (uint64_t)key);
+    } GUARD_EXCEPT { state = 0; }
+    return (state & 0x80) != 0;
+}
+
+/* The widget of this name below widget, or 0. */
+static uint64_t keybindPart(uint64_t widget, const char* name) {
+    if (!widget) return 0;
+    uint64_t part = 0;
+    GUARD_TRY {
+        part = ((FindChildFn)(global_moduleBase + FIND_CHILD_RVA))(widget, name, 0);
+    } GUARD_EXCEPT_DESCRIBING("finding a part of a keybind's row") { part = 0; }
+    return part;
+}
+
+/* Plays an animation label of the widget file a part was made from. */
+static void keybindPlay(uint64_t part, const char* label) {
+    if (!part) return;
+    GUARD_TRY {
+        ((PlayLabelFn)(global_moduleBase + PLAY_LABEL_RVA))(
+            part, hashText(label), 0, 0, 0, 0, -1.0f, 1.0f);
+    } GUARD_EXCEPT_DESCRIBING("playing a state of a keybind's row") { }
+}
+
+/* Sets a part's property through its own setter. */
+static void keybindSet(uint64_t part, const char* name, const BoxedValue* value) {
+    if (!part) return;
+    const uint64_t setter = widgetMethod(part, WIDGET_SET_PROPERTY_SLOT);
+    if (!setter) return;
+    GUARD_TRY { ((SetPropertyFn)setter)(part, hashText(name), value); }
+    GUARD_EXCEPT_DESCRIBING("setting a part of a keybind's cell") { }
+}
+
+static void keybindSetText(uint64_t part, const char* name, const char* text) {
+    BoxedValue value;
+    boxString(&value, text);
+    keybindSet(part, name, &value);
+}
+
+static void keybindSetShown(uint64_t part, int shown) {
+    BoxedValue value;
+    value.payload = (const void*)(uintptr_t)(shown ? 1 : 0);
+    value.spare = 0;
+    value.type = BOXED_BOOL_TYPE;
+    keybindSet(part, "visible", &value);
+}
+
+/* The object the menu root is, and it as the menu root, or 0. */
+static uint64_t menuObject(void) {
+    uint64_t object = 0;
+    GUARD_TRY { object = ((MenuObjectFn)(global_moduleBase + MENU_OBJECT_RVA))(); }
+    GUARD_EXCEPT_DESCRIBING("asking for the menu root") { object = 0; }
+    return object;
+}
+
+/* Tells the menus something changed, as the game's own menus do after
+   playing a state. */
+static void keybindMarkChanged(void) {
+    const uint64_t object = menuObject();
+    if (!isPointer(object)) return;
+    GUARD_TRY { *(volatile uint8_t*)(object + MENU_ROOT_CHANGED) = 1; }
+    GUARD_EXCEPT { }
+}
+
+/* The mouse cursor's state: keyboard while a keybind row has focus. */
+static void keybindCursor(const char* label) {
+    const uint64_t object = menuObject();
+    if (!object) return;
+    GUARD_TRY {
+        const uint64_t root = ((AsMenuRootFn)(global_moduleBase
+                                              + AS_MENU_ROOT_RVA))(object);
+        if (root)
+            ((PlayCursorFn)(global_moduleBase + PLAY_CURSOR_RVA))(root,
+                                                                 hashText(label));
+    } GUARD_EXCEPT_DESCRIBING("setting the mouse cursor's state") { }
+    keybindMarkChanged();
+}
+
+/* One of the game's menu sounds, played once. The process is answered, for a
+   sound that may need ending. */
+static uint64_t keybindSound(const char* name) {
+    __declspec(align(16)) uint8_t info[SFX_SPAWN_INFO_BYTES];
+    memset(info, 0, sizeof(info));
+    uint64_t zero = 0, process = 0;
+    GUARD_TRY {
+        ((SfxSpawnInfoFn)(global_moduleBase + SFX_SPAWN_INFO_RVA))(
+            info, hashText(name), 0, &zero);
+        process = ((SpawnProcessFn)(global_moduleBase + SPAWN_PROCESS_RVA))(info, 0);
+    } GUARD_EXCEPT_DESCRIBING("playing a menu sound") { process = 0; }
+    return process;
+}
+
+/* The hold sound, ended where it still plays and processes may be killed. */
+static void keybindEndHoldSound(void) {
+    KeybindWait* w = &global_keybindWait;
+    const uint64_t process = widgetOfHandle(w->holdSoundRecord, w->holdSoundId);
+    w->holdSoundRecord = 0;
+    w->holdSoundId = 0;
+    if (!process) return;
+    uint64_t manager = 0;
+    if (!readQword(global_moduleBase + PROCESS_MANAGER_RVA, &manager)
+        || !isPointer(manager))
+        return;
+    unsigned char killable = 0;
+    readByte(manager + PROCESSES_KILLABLE, &killable);
+    if (!killable) return;
+    GUARD_TRY { ((KillTreeFn)(global_moduleBase + KILL_TREE_RVA))(process); }
+    GUARD_EXCEPT_DESCRIBING("ending the hold sound") { }
+}
+
+/* The icon the game gives a key, as the path of its picture; empty where it
+   has none. Asked once for each key; the text stays where it is. A letter's
+   icon is its lower case code's. */
+static const char* keyIconOf(int key) {
+    if (key <= 0 || key > 0xFF) return "";
+    if (global_keyIconAsked[key]) return global_keyIconPath[key];
+    global_keyIconAsked[key] = 1;
+    char* path = global_keyIconPath[key];
+    path[0] = 0;
+    uint8_t code = global_gameCodeOfKey[key];
+    if (!code) return path;
+    if (code >= 0x41 && code <= 0x5A) code = (uint8_t)(code + 0x20);
+    IconBuilder builder;
+    memset(&builder, 0, sizeof(builder));
+    builder.type = global_moduleBase + ICON_BUILDER_TYPE_RVA;
+    builder.capacity = 0x100;
+    int ok = 1;
+    GUARD_TRY {
+        ((KeyIconTextFn)(global_moduleBase + KEY_ICON_TEXT_RVA))(
+            (uint64_t)code, &builder, 0);
+    } GUARD_EXCEPT_DESCRIBING("asking for a key's icon") { ok = 0; }
+    builder.text[sizeof(builder.text) - 1] = 0;
+    if (ok && builder.length < 0x100 && strstr(builder.text, ".svg")
+        && !strchr(builder.text, '<') && !strchr(builder.text, '|'))
+        strncpy_s(path, sizeof(global_keyIconPath[0]), builder.text, _TRUNCATE);
+    return path;
+}
+
+/* The cell shows key: its icon, or its name where the game has no icon. */
+static void keybindShowKey(uint64_t cell, int key) {
+    const uint64_t icon = keybindPart(cell, "primaryKeyboardIcon");
+    const uint64_t name = keybindPart(cell, "keyName");
+    const char* path = keyIconOf(key);
+    if (path[0]) {
+        keybindSetText(icon, "value", path);
+        keybindSetShown(icon, 1);
+        keybindSetShown(name, 0);
+    } else {
+        char* text = global_keyNameText[key & 0xFF];
+        keyNameOf(key, text, sizeof(global_keyNameText[0]));
+        keybindSetText(name, "value", text);
+        keybindSetShown(name, 1);
+        keybindSetShown(icon, 0);
+    }
+}
+
+/* A state of the cell, played on the cell and on its frame, as the game's
+   Menu2::RemapColumnItems plays one (01C49244). */
+static void keybindCellState(uint64_t cell, const char* label) {
+    keybindPlay(cell, label);
+    keybindPlay(keybindPart(cell, "columnItemRefPrimKbm"), label);
+}
+
+/* A page's flags: it ignores its own input, or takes it again. */
+static void keybindPageFlag(uint64_t page, int ignores) {
+    if (!isPointer(page)) return;
+    GUARD_TRY {
+        volatile uint8_t* flags = (volatile uint8_t*)(page + PAGE_FLAGS);
+        *flags = ignores ? (uint8_t)(*flags | PAGE_IGNORES_INPUT)
+                         : (uint8_t)(*flags & ~PAGE_IGNORES_INPUT);
+    } GUARD_EXCEPT_DESCRIBING("setting whether a page takes its input") { }
+}
+
+/* The page a row is on is told to ignore its own input while a key is waited
+   for, and is held by its handle, so it is told to take it again even where
+   the row has gone. */
+static void keybindPageIgnoresInput(uint64_t row) {
+    KeybindWait* w = &global_keybindWait;
+    uint64_t page = 0;
+    GUARD_TRY { page = ((PageOfFn)(global_moduleBase + PAGE_OF_RVA))(row); }
+    GUARD_EXCEPT_DESCRIBING("asking which page a row is on") { page = 0; }
+    w->pageRecord = 0;
+    w->pageId = 0;
+    if (!isPointer(page)) return;
+    GUARD_TRY {
+        w->pageRecord = *(volatile uint64_t*)(page + ROW_RECORD);
+        w->pageId = *(volatile uint32_t*)(page + ROW_ID);
+    } GUARD_EXCEPT { w->pageRecord = 0; w->pageId = 0; }
+    keybindPageFlag(page, 1);
+}
+
+static void keybindPageTakesInput(void) {
+    KeybindWait* w = &global_keybindWait;
+    keybindPageFlag(widgetOfHandle(w->pageRecord, w->pageId), 0);
+    w->pageRecord = 0;
+    w->pageId = 0;
+}
+
+/* The menu's own commands turned aside for the next frame, as the game's
+   page turns them aside while it rebinds. */
+static void keybindTurnCommandsAside(uint64_t row) {
+    static const char* const command[][2] = {
+        { "pause", "pause-vc" }, { "menu-inspect", "menu-inspect-vc" },
+        { "menu-back", "menu-back-vc" }, { "menu-up", "menu-up-vc" },
+        { "menu-left", "menu-left-vc" }, { "menu-right", "menu-right-vc" },
+        { "menu-down", "menu-down-vc" },
+    };
+    uint64_t input = 0;
+    GUARD_TRY { input = ((InputOfFn)(global_moduleBase + INPUT_OF_RVA))(row); }
+    GUARD_EXCEPT_DESCRIBING("asking which input a page reads") { input = 0; }
+    if (!isPointer(input)) return;
+    for (size_t i = 0; i < sizeof(command) / sizeof(command[0]); ++i) {
+        GUARD_TRY {
+            ((TurnCommandFn)(global_moduleBase + TURN_COMMAND_RVA))(
+                input, hashText(command[i][0]), hashText(command[i][1]));
+        } GUARD_EXCEPT_DESCRIBING("turning a menu command aside") { }
+    }
+}
+
+/* The binding texts' bar (an IProgressBar::ProgressBar, its fill barFull), or
+   0. */
+static uint64_t keybindBar(uint64_t texts) {
+    const uint64_t part = keybindPart(texts, "progressBar");
+    if (!part) return 0;
+    uint64_t bar = 0;
+    GUARD_TRY {
+        bar = ((AsProgressBarFn)(global_moduleBase + AS_PROGRESS_BAR_RVA))(part);
+    } GUARD_EXCEPT_DESCRIBING("asking for a keybind's bar") { bar = 0; }
+    return bar;
+}
+
+/* The bar filled to fraction at once, as the game's page fills it each frame
+   while a key is held (01C47CF8). */
+static void keybindProgress(uint64_t texts, float fraction) {
+    const uint64_t bar = keybindBar(texts);
+    if (!bar) return;
+    uint64_t table = 0, show = 0, set = 0;
+    if (!readQword(bar, &table) || !readQword(table + PROGRESS_SHOW_SLOT, &show)
+        || !readQword(table + PROGRESS_SET_SLOT, &set))
+        return;
+    GUARD_TRY {
+        ((ProgressShowFn)show)(bar, 1);
+        ((ProgressSetFn)set)(bar, fraction, 0.0f, PROGRESS_CURVE, 0);
+    } GUARD_EXCEPT_DESCRIBING("filling a keybind's bar") { }
+}
+
+/* The bar run back to empty at a whole bar a second, as the game's page runs
+   it back when a key is let go too soon (01C47A38). */
+static void keybindProgressEmpties(uint64_t texts) {
+    const uint64_t bar = keybindBar(texts);
+    if (!bar) return;
+    GUARD_TRY {
+        ((ProgressEaseFn)(global_moduleBase + PROGRESS_EASE_RVA))(
+            bar, 0.0f, 1.0f, PROGRESS_CURVE, 0.0f);
+    } GUARD_EXCEPT_DESCRIBING("emptying a keybind's bar") { }
+}
+
+/*
+    The game's menu actions, the 29 of its control scheme whose names begin
+    menu: (test run 10's BINDINGS lines), photo mode's among them; every other
+    action is a gameplay action. An action's id is its name's FNV-1a; the ids
+    are worked out when first asked.
+*/
+static const char* const global_menuActionName[] = {
+    "menu:action", "menu:back", "menu:camera-in", "menu:camera-lock",
+    "menu:down", "menu:inspect", "menu:left", "menu:nav-neg", "menu:nav-pos",
+    "menu:next", "menu:pan", "menu:pause", "menu:photo-screenshot",
+    "menu:player", "menu:prev", "menu:right", "menu:select", "menu:slot0",
+    "menu:slot1", "menu:slot2", "menu:slot3", "menu:slot4", "menu:slot5",
+    "menu:slot6", "menu:slot7", "menu:slot8", "menu:thirds", "menu:up",
+    "menu:zoom",
+};
+#define MENU_ACTIONS (sizeof(global_menuActionName) / sizeof(global_menuActionName[0]))
+
+static uint64_t global_menuActionId[MENU_ACTIONS];
+static int      global_menuActionIdsMade = 0;
+
+static int keybindMenuAction(uint64_t action) {
+    if (!global_menuActionIdsMade) {
+        for (size_t i = 0; i < MENU_ACTIONS; ++i)
+            global_menuActionId[i] = hashText(global_menuActionName[i]);
+        global_menuActionIdsMade = 1;
+    }
+    for (size_t i = 0; i < MENU_ACTIONS; ++i)
+        if (global_menuActionId[i] == action) return 1;
+    return 0;
+}
+
+/*
+    Whether a keybind refuses a key because the game's own controls bind it:
+    the keyboard bindings of the control scheme in use. A binding to one of
+    the game's menu actions (keybindMenuAction) refuses the key unless the
+    keybind allows menu keys (KeybindAllowMenuKeys, True unless the menupage
+    says False), and a binding to any other action unless it allows gameplay
+    keys (KeybindAllowGameplayKeys, False unless the menupage says True), so a
+    mod that needs a key the game uses for something else can say so.
+
+    The schemes are at [CONTROL_SCHEMES_RVA],
+    CONTROL_SCHEME_BYTES each, and the one in use is the one the index at
+    CONTROL_SCHEME_IN_USE_RVA names, as the game's input (0202EFB8) and its
+    button prompts (020E2C94) take it; the Customise Controls page edits a
+    copy (edit-schemes) only while it is open. A scheme's keyboard map
+    (SCHEME_KEYBOARD_MAP: the entries, and their count SCHEME_MAP_COUNT after
+    them) holds sixteen bytes an action: its id, then its primary and
+    secondary keys as the game's key codes in 32 bits each, 0 for none
+    (020CA004). A letter is kept by its lower case code; its upper case code
+    is matched too. Where the scheme cannot be read, nothing is refused.
+*/
+static int keybindBoundInGame(const OurSetting* s, int key) {
+    if (key <= 0 || key > 0xFF || (s->allowMenuKeys && s->allowGameplayKeys))
+        return 0;
+    uint32_t code = global_gameCodeOfKey[key];
+    if (!code) return 0;
+    uint32_t other = code;
+    if (code >= 0x41 && code <= 0x5A) code += 0x20;
+    if (code >= 0x61 && code <= 0x7A) other = code - 0x20;
+    uint64_t schemes = 0, entries = 0, count = 0;
+    uint32_t inUse = 0, schemeCount = 0;
+    if (!readQword(global_moduleBase + CONTROL_SCHEMES_RVA, &schemes)
+        || !readDword(global_moduleBase + CONTROL_SCHEME_IN_USE_RVA, &inUse)
+        || !readDword(global_moduleBase + CONTROL_SCHEME_COUNT_RVA, &schemeCount)
+        || !isPointer(schemes) || inUse >= schemeCount)
+        return 0;
+    const uint64_t scheme = schemes + (uint64_t)inUse * CONTROL_SCHEME_BYTES;
+    if (!readQword(scheme + SCHEME_KEYBOARD_MAP, &entries)
+        || !readQword(scheme + SCHEME_KEYBOARD_MAP + SCHEME_MAP_COUNT, &count)
+        || !isPointer(entries))
+        return 0;
+    if (count > SCHEME_MAP_MOST) count = SCHEME_MAP_MOST;
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t action = 0, keys = 0;
+        if (!readQword(entries + 16ull * i, &action)
+            || !readQword(entries + 16ull * i + 8, &keys))
+            return 0;
+        if (!action || action == ~0ull) continue;
+        const uint32_t primary = (uint32_t)keys, secondary = (uint32_t)(keys >> 32);
+        if (primary != code && secondary != code && primary != other
+            && secondary != other)
+            continue;
+        if (keybindMenuAction(action) ? !s->allowMenuKeys : !s->allowGameplayKeys)
+            return 1;
+    }
+    return 0;
+}
+
+/* The state of a cell: hovered while its row has focus, disabled while its
+   control is locked. */
+static int keybindCellStateOf(int focus, int locked) {
+    return (focus ? 1 : 0) | (locked ? 2 : 0);
+}
+
+static const char* const global_keybindCellLabel[4] = {
+    "normal", "hovered", "disabled", "hovered_disabled"
+};
+
+/* A keybind's cell, filled whole: its key, and its state. */
+static void keybindFillCell(OurSetting* s, uint64_t row, int focus) {
+    const int key = (int)s->value;
+    const int state = keybindCellStateOf(focus, whyLocked(s) != LOCKED_BY_NOTHING);
+    /* A row drawn again from a new handle is filled again. */
+    const uint64_t handle = s->rowRecord ^ (uint64_t)s->rowId;
+    const uint64_t cell = keybindPart(row, "keybindCell");
+    if (handle != s->keybindRow) {
+        s->keybindRow = handle;
+        s->keybindKey = -1;
+        s->keybindFocus = -1;
+        keybindPlay(keybindPart(cell, "bindingTexts"), "normal");
+    }
+    if (key != s->keybindKey) {
+        keybindShowKey(cell, key);
+        s->keybindKey = key;
+    }
+    if (state != s->keybindFocus) {
+        keybindCellState(cell, global_keybindCellLabel[state]);
+        s->keybindFocus = state;
+        keybindMarkChanged();
+    }
+}
+
+/* The wait for a key ends. cancelled plays sfx-back, as the game's page does
+   when its wait ends without a key. */
+static void keybindStopWaiting(OurSetting* s, uint64_t row, int cancelled) {
+    KeybindWait* w = &global_keybindWait;
+    keybindEndHoldSound();
+    w->setting = -1;
+    w->holding = 0;
+    w->progressShown = 0;
+    keybindPageTakesInput();
+    if (cancelled) keybindSound("sfx-back");
+    if (!row) return;
+    const uint64_t cell = keybindPart(row, "keybindCell");
+    keybindPlay(keybindPart(cell, "bindingTexts"), "normal");
+    keybindPlay(row, rowHasFocus(row) ? "focused" : "normal");
+    keybindMarkChanged();
+    s->keybindKey = -1;   /* shown again */
+    s->keybindFocus = -1;
+    keybindFillCell(s, row, rowHasFocus(row));
+}
+
+/* The wait for a key begins, on the row of keybind which. */
+static void keybindStartWaiting(int which, uint64_t row) {
+    KeybindWait* w = &global_keybindWait;
+    w->setting = which;
+    w->holding = 0;
+    w->heldSince = 0;
+    w->progressShown = 0;
+    w->holdSoundRecord = 0;
+    w->holdSoundId = 0;
+    memset(w->ignored, 0, sizeof(w->ignored));
+    for (int key = 1; key < 0xFF; ++key)
+        if (keyHeldNow(key)) w->ignored[key >> 3] |= (uint8_t)(1u << (key & 7));
+    const uint64_t cell = keybindPart(row, "keybindCell");
+    keybindPlay(keybindPart(cell, "bindingTexts"), "focused");
+    keybindPlay(row, "secondary_focused");
+    keybindPageIgnoresInput(row);
+    keybindSound("sfx-open");
+    keybindMarkChanged();
+}
+
+/* The key is set: written to the store and taken by the control. */
+static void keybindSetKey(OurSetting* s, int key) {
+    char text[16];
+    sprintf_s(text, "0x%02X", key);
+    takeValue(s, text, 0);
+    s->touched = 1;
+    keepText(s->storePath, s->storeSection, s->storeKey, text);
+    settleAfterChange(s);
+    refreshControl(s);   /* the title takes or drops its bullet */
+}
+
+/* Every frame while a key is waited for. */
+static void keybindWaitForKey(OurSetting* s, uint64_t row) {
+    KeybindWait* w = &global_keybindWait;
+    if (!rowHasFocus(row) || whyLocked(s) != LOCKED_BY_NOTHING) {
+        keybindStopWaiting(s, row, 1);
+        return;
+    }
+    keybindTurnCommandsAside(row);
+    for (int key = 1; key < 0xFF; ++key)
+        if (!keyHeldNow(key)) w->ignored[key >> 3] &= (uint8_t)~(1u << (key & 7));
+    const int escapeIgnored = (w->ignored[KEYBIND_ESCAPE >> 3]
+                               >> (KEYBIND_ESCAPE & 7)) & 1;
+    if (keyHeldNow(KEYBIND_ESCAPE) && !escapeIgnored) {
+        keybindStopWaiting(s, row, 1);
+        return;
+    }
+    const ULONGLONG now = GetTickCount64();
+    const uint64_t texts = keybindPart(keybindPart(row, "keybindCell"),
+                                       "bindingTexts");
+    if (w->holding) {
+        if (!keyHeldNow(w->holding)) {
+            /* Let go too soon: the wait goes on. */
+            w->holding = 0;
+            if (w->progressShown) {
+                w->progressShown = 0;
+                keybindEndHoldSound();
+                keybindSound("sfx-menu-new-button-assign-cancel");
+                keybindProgressEmpties(texts);
+                keybindPlay(texts, "focused");
+                keybindMarkChanged();
+            }
+            return;
+        }
+        const double held = (double)(now - w->heldSince) / 1000.0;
+        if (held < KEYBIND_HOLD_SECONDS) return;
+        if (!w->progressShown) {
+            w->progressShown = 1;
+            keybindSetText(keybindPart(texts, "oldBindingIcon"), "value",
+                           keyIconOf((int)s->value));
+            keybindSetText(keybindPart(texts, "newBindingIcon"), "value",
+                           keyIconOf(w->holding));
+            keybindPlay(texts, "binding");
+            const uint64_t sound = keybindSound("sfx-menu-new-button-assign-hold");
+            uint64_t record = 0;
+            uint32_t id = 0;
+            if (isPointer(sound) && readQword(sound + ROW_RECORD, &record)) {
+                GUARD_TRY { id = *(volatile uint32_t*)(sound + ROW_ID); }
+                GUARD_EXCEPT { id = 0; }
+                w->holdSoundRecord = record;
+                w->holdSoundId = id;
+            }
+            keybindMarkChanged();
+        }
+        double fraction = (held - KEYBIND_HOLD_SECONDS) / KEYBIND_FILL_SECONDS;
+        if (fraction > 1.0) fraction = 1.0;
+        keybindProgress(texts, (float)fraction);
+        if (fraction >= 1.0) {
+            const int key = w->holding;
+            keybindSetKey(s, key);
+            keybindSound("sfx-menu-new-button-assign-complete");
+            keybindStopWaiting(s, row, 0);
+        }
+        return;
+    }
+    for (int key = 1; key < 0xFF; ++key) {
+        if (!keybindTakes(key) || !keyHeldNow(key)
+            || ((w->ignored[key >> 3] >> (key & 7)) & 1))
+            continue;
+        if (keybindBoundInGame(s, key)) {
+            /* Refused once as it goes down, then passed over until let go. */
+            w->ignored[key >> 3] |= (uint8_t)(1u << (key & 7));
+            keybindSound("sfx-menu-error");
+            continue;
+        }
+        w->holding = key;
+        w->heldSince = now;
+        break;
+    }
+}
+
+/* Every frame: each keybind's cell filled, the cursor kept, and the wait for
+   a key kept. */
+static void keybindTick(void) {
+    if (!global_keybindsKnown) return;
+    const LONG asked = InterlockedExchange(&global_keybindAsked, -1);
+    if (asked >= 0 && asked < global_ourSourceCount
+        && global_keybindWait.setting < 0) {
+        OurSetting* s = &global_ourSources[asked];
+        const uint64_t row = rowNow(s);
+        if (s->kind == KIND_KEYBIND && row && whyLocked(s) == LOCKED_BY_NOTHING)
+            keybindStartWaiting((int)asked, row);
+    }
+    int anyFocus = 0;
+    for (int i = 0; i < global_ourSourceCount; ++i) {
+        OurSetting* s = &global_ourSources[i];
+        if (s->kind != KIND_KEYBIND) continue;
+        const uint64_t row = rowNow(s);
+        if (!row) {
+            s->keybindRow = 0;
+            if (global_keybindWait.setting == i) keybindStopWaiting(s, 0, 0);
+            continue;
+        }
+        const int focus = rowHasFocus(row);
+        anyFocus |= focus;
+        if (global_keybindWait.setting == i) keybindWaitForKey(s, row);
+        else keybindFillCell(s, row, focus);
+    }
+    /* The cursor shows the keyboard over a keybind row, as over the game's
+       own keyboard columns, and is put back when no keybind row has focus. */
+    if (anyFocus && !global_keybindCursor) {
+        keybindCursor("keyboard");
+        global_keybindCursor = 1;
+    } else if (!anyFocus && global_keybindCursor) {
+        keybindCursor("normal");
+        global_keybindCursor = 0;
+    }
+}
+
+/*
+    02660DA0, an event sent from a component to its page: a keybind's row was
+    chosen. A Menu2::Button sends one when menu-select is pressed on it
+    (026BAE74, its slot 140): the event of its own instance name (026BB29C),
+    and its action, send-event KEYBIND_EVENT, sends that one. Any event from a
+    keybind's row counts, whichever comes. Only noted here; keybindTick acts
+    on it.
+*/
+static void sendEventHook(void* registers, void*) {
+    const uint64_t component = loaderHookRegister(registers, LOADER_REG_RCX);
+    if (!isPointer(component)) return;
+    OurSetting* s = ourSourceByObject(sourceOfComponent(
+        component, "asking a chosen row for its source"));
+    if (!s || s->kind != KIND_KEYBIND) return;
+    InterlockedExchange(&global_keybindAsked, (LONG)(s - global_ourSources));
+}
+
+/* The hook a keybind's row needs, where a menupage has one and the game is
+   the build the addresses are for. */
+static void installKeybinds() {
+    int any = 0;
+    for (int i = 0; i < global_ourSourceCount && !any; ++i)
+        any = global_ourSources[i].kind == KIND_KEYBIND;
+    if (!any) return;
+    if (loaderGameTimeDateStamp() != KEYBIND_BUILD_STAMP) {
+        writeLog("KEYBIND the game is not tlou-i.exe 1.1.5.0, whose addresses "
+                 "the keybind control uses, so a keybind's row shows its title "
+                 "alone and cannot be set");
+        return;
+    }
+    if (!loaderHookAddress("modmenu_send_event", global_moduleBase + SEND_EVENT_RVA,
+                           sendEventHook, nullptr)) {
+        writeLog("KEYBIND the loader refused the hook on the event a row sends, "
+                 "so no keybind can be set");
+        return;
+    }
+    global_keybindsKnown = 1;
 }
 
 /* ----------------------------------------------------------- the entry point */
@@ -6655,6 +8392,7 @@ static void installHooks() {
     loadModPages();
     makeSettingsFromModPages();
     generateMenuPages();
+    installKeybinds();
 
     const uint64_t reader = findWidgetFileReader();
     if (reader) {
@@ -6761,6 +8499,12 @@ extern "C" TLOU_PLUGIN_EXPORT int ModMenuDescribeControl(int at, char* out,
                   (double)s->least, (double)s->greatest, (double)s->step);
     else if (s->kind == KIND_SELECTOR || s->kind == KIND_TOGGLE)
         sprintf_s(more, ", it offers %d option(s)", s->optionCount);
+    else if (s->kind == KIND_PRESET)
+        sprintf_s(more, ", it offers %d preset(s), and shows the last option "
+                        "while none matches", s->optionCount - 1);
+    else if (s->kind == KIND_KEYBIND)
+        sprintf_s(more, ", it is a keybind%s", global_keybindWait.setting == at
+                                                ? " waiting for a key" : "");
     if (s->hidden) strcat_s(more, sizeof(more), ", and it is hidden");
     char line[MAX_SETTING_TEXT * 6 + 480];
     sprintf_s(line, "\"%s\" reads %s in [%s], %s; the store held \"%s\", it "
@@ -6794,7 +8538,7 @@ extern "C" TLOU_PLUGIN_EXPORT unsigned ModMenuControlChanges(void) {
 }
 
 extern "C" TLOU_PLUGIN_EXPORT const char* PluginName(void)    { return "Mod Menu Framework"; }
-extern "C" TLOU_PLUGIN_EXPORT const char* PluginVersion(void) { return "v1.0.1"; }
+extern "C" TLOU_PLUGIN_EXPORT const char* PluginVersion(void) { return "v1.1.0"; }
 extern "C" TLOU_PLUGIN_EXPORT const char* PluginAuthor(void)  { return "mwith77"; }
 
 extern "C" TLOU_PLUGIN_EXPORT int SupportsGame(LoaderHandle) { return 1; }

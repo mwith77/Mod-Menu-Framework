@@ -9,8 +9,9 @@ A mod adds its page by dropping one `.menupage` file, which describes the mod's
 settings and names the mod's ini. The framework does the menu work and edits
 that ini directly, so a mod needs no menu code of its own.
 
-Version 1.0.2, for `tlou-i.exe` 1.1.5.0. It loads through the
-[TLOU Plugin Loader](../TLOU%20Plugin%20Loader) and does nothing without it.
+Version 1.1.0, for `tlou-i.exe` 1.1.5.0. It loads through the
+[TLOU Plugin Loader](https://github.com/mwith77/TLOU-Plugin-Loader) and does
+nothing without it.
 
 ## Files
 
@@ -27,7 +28,7 @@ Version 1.0.2, for `tlou-i.exe` 1.1.5.0. It loads through the
 ## Building
 
 From the x64 Native Tools Command Prompt for Visual Studio, which provides
-`cl`, run `build_mod_menu_framework.bat` in this folder. It builds
+`cl` and `rc`, run `build_mod_menu_framework.bat` in this folder. It builds
 `mod_menu_framework.dll`.
 
 ## Installing
@@ -47,11 +48,23 @@ the framework.
 ## Writing a mod page
 
 A `.menupage` names the mod, points at the mod's ini, and lists each setting as
-a control (a slider, a toggle, a selector) with its ini key, default and
-description. The framework draws the page and writes each change straight to the
-named ini. The mod reads its ini as it normally would.
-`Mod Menus\example_mod.menupage`, with `example_mod.ini`, is a worked example to
-write your own from.
+a control with its ini key, default and description. The framework draws the
+page and writes each change straight to the named ini. The mod reads its ini as
+it normally would. `Mod Menus\example_mod.menupage`, with `example_mod.ini`, is
+a worked example to write your own from.
+
+A control's `ControlType` is one of these:
+
+| ControlType | What it is |
+| --- | --- |
+| `Toggle` | Two values, such as OFF and ON. |
+| `Selector` | A list of named values. |
+| `Slider` | A number between a minimum and a maximum, in steps. `SliderValueText` can show text in place of the number, for example `[IF(VALUE > 30, "Persistent", VALUE)]`. |
+| `Preset` | A selector whose options each set several settings at once (`PresetValues`), followed by Custom, which puts back the values held before a preset was chosen. |
+| `Keybind` | A key, kept in the ini as its Windows virtual-key code (F9 is `0x78`) and set by holding it, as on the game's Customise Controls page. `KeybindAllowMenuKeys` and `KeybindAllowGameplayKeys` say whether it may take a key the game already uses in its menus or in play; by default menu keys are allowed and gameplay keys are refused. |
+
+`Preset`, `Keybind` and `SliderValueText` are new in version 1.1.0. A page that
+uses them needs 1.1.0 or later; every page written for 1.0.2 works unchanged.
 
 ## Logs
 
