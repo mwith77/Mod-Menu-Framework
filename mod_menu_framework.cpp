@@ -10,7 +10,8 @@
 
         Mod Menu Framework\mod_menu_framework.dll
         Mod Menu Framework\mod_menu_framework.ini
-        Mod Menu Framework\Logs\mod_menu_framework.log
+        Mod Menu Framework\mod_menu_framework.log (newest line first, at
+                                                    most LOG_MOST_BYTES)
         Mod Menu Framework\Mod Menus\<name>.menupage
         Mod Menu Framework\Game Menus\<name>.menupage
         Mod Menu Framework\Game Menus\Menu Templates\<name>.json
@@ -23,7 +24,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+
+/* GetAsyncKeyState, GetForegroundWindow and GetWindowThreadProcessId, for a
+   Keybind control's key in The Last of Us Part II. */
+#pragma comment(lib, "user32.lib")
 #include <cmath>
+#include <ctime>
 #include <malloc.h>
 
 #undef near
@@ -61,18 +67,68 @@ static char global_iniPath[MAX_PATH];
 
 /* ---------------------------------------------------------------- the log */
 
-/* Every line carries the machine's local date and time. */
+/*
+    The log is one file, newest line first: each line is written above the
+    lines already there, the earlier runs' included. It is at most
+    LOG_MOST_BYTES; the oldest lines, at its end, are left out to keep it
+    there. Each line is written through <log>.new, renamed over the log.
+    Every line carries the machine's local date and time.
+*/
+#define LOG_MOST_BYTES (1024u * 1024u)
+#define LOG_LINE_MOST  4096
+
+static SRWLOCK global_logLock = SRWLOCK_INIT;
+
 static void writeLogList(const char* fmt, va_list ap) {
-    FILE* f = nullptr;
-    if (fopen_s(&f, global_logPath, "a") != 0 || !f) return;
+    if (!global_logPath[0]) return;
+    char line[LOG_LINE_MOST];
     SYSTEMTIME now;
     GetLocalTime(&now);
-    fprintf(f, "%04u-%02u-%02u %02u:%02u:%02u.%03u  ",
-            now.wYear, now.wMonth, now.wDay,
-            now.wHour, now.wMinute, now.wSecond, now.wMilliseconds);
-    vfprintf(f, fmt, ap);
-    fprintf(f, "\n");
-    fclose(f);
+    int used = sprintf_s(line, "%04u-%02u-%02u %02u:%02u:%02u.%03u  ",
+                         now.wYear, now.wMonth, now.wDay, now.wHour,
+                         now.wMinute, now.wSecond, now.wMilliseconds);
+    if (used < 0) return;
+    const int text = _vsnprintf_s(line + used, sizeof(line) - used - 1,
+                                  _TRUNCATE, fmt, ap);
+    used = text < 0 ? (int)strlen(line) : used + text;
+    line[used++] = '\n';
+
+    AcquireSRWLockExclusive(&global_logLock);
+    char* out = (char*)malloc(LOG_MOST_BYTES);
+    if (out) {
+        memcpy(out, line, (size_t)used);
+        size_t total = (size_t)used;
+        const HANDLE old = CreateFileA(global_logPath, GENERIC_READ,
+                                       FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                                       FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (old != INVALID_HANDLE_VALUE) {
+            DWORD got = 0;
+            const DWORD room = (DWORD)(LOG_MOST_BYTES - total);
+            if (ReadFile(old, out + total, room, &got, nullptr)) {
+                LARGE_INTEGER size;
+                if (GetFileSizeEx(old, &size) && size.QuadPart > (LONGLONG)got)
+                    while (got > 0 && out[total + got - 1] != '\n') --got;
+                total += got;
+            }
+            CloseHandle(old);
+        }
+        char fresh[MAX_PATH];
+        if (sprintf_s(fresh, "%s.new", global_logPath) > 0) {
+            const HANDLE file = CreateFileA(fresh, GENERIC_WRITE, 0, nullptr,
+                                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                            nullptr);
+            if (file != INVALID_HANDLE_VALUE) {
+                DWORD wrote = 0;
+                const BOOL ok = WriteFile(file, out, (DWORD)total, &wrote, nullptr)
+                             && wrote == (DWORD)total;
+                CloseHandle(file);
+                if (ok) MoveFileExA(fresh, global_logPath, MOVEFILE_REPLACE_EXISTING);
+                else DeleteFileA(fresh);
+            }
+        }
+        free(out);
+    }
+    ReleaseSRWLockExclusive(&global_logLock);
 }
 
 static void writeLog(const char* fmt, ...) {
@@ -82,13 +138,18 @@ static void writeLog(const char* fmt, ...) {
     va_end(ap);
 }
 
+static void expressionLine(const char* fmt, ...);
+
 /*
     Copies text into out, which has room bytes. Text that does not fit is cut
     short and a log line says so, naming the text by what. Text whose length a
-    file decides is copied through here.
+    file decides is copied through here. capped writes that line as an
+    expressionLine, which is capped and is not written while expressions are
+    worked out quietly, for text cut again each time an expression or a
+    dependency is worked out.
 */
 static void copyBounded(char* out, size_t room, const char* text,
-                        const char* what) {
+                        const char* what, int capped = 0) {
     if (!out || !room) return;
     out[0] = 0;
     if (!text) return;
@@ -96,9 +157,10 @@ static void copyBounded(char* out, size_t room, const char* text,
     if (length < room) { memcpy(out, text, length + 1); return; }
     memcpy(out, text, room - 1);
     out[room - 1] = 0;
-    writeLog("MENU the %s is %u character(s) and there is room for %u, so it "
-             "was cut short", what ? what : "text", (unsigned)length,
-             (unsigned)(room - 1));
+    (capped ? expressionLine : writeLog)(
+        "MENU the %s is %u character(s) and there is room for %u, so it was "
+        "cut short", what ? what : "text", (unsigned)length,
+        (unsigned)(room - 1));
 }
 
 /* Formats into out. Answers 0 when the result does not fit in room, and out is
@@ -141,49 +203,305 @@ static int spelledAt(const char* from, const char* end, const char* word) {
     return (size_t)(end - from) >= length && _strnicmp(from, word, length) == 0;
 }
 
-/* The log of the previous run, moved into an Archive folder beside it and
-   named for the local time it was last written. */
-static void archiveLog() {
-    WIN32_FILE_ATTRIBUTE_DATA about;
-    if (!GetFileAttributesExA(global_logPath, GetFileExInfoStandard, &about)
-        || (!about.nFileSizeLow && !about.nFileSizeHigh)) return;
+/* --------------------------------------------------- the default settings */
 
-    char folder[MAX_PATH];
-    strcpy_s(folder, global_logPath);
-    char* slash = strrchr(folder, '\\');
-    if (!slash) return;
-    *slash = 0;
-    char archive[MAX_PATH];
-    sprintf_s(archive, "%s\\Archive", folder);
-    CreateDirectoryA(archive, nullptr);
+/*
+    The default settings are the RCDATA resource DEFAULT_SETTINGS: the
+    plugin's ini as it stands in the project. Read as an ini, a line [name]
+    opens a section, a line key = value below it is a setting of that
+    section, and a line opening with ; is a comment. The blanks around a name,
+    a key or a value are not part of it. Lines end in CR, LF or CR LF.
+*/
 
-    /* The local time the log was written at, with that date's daylight
-       saving offset. */
-    SYSTEMTIME written, when;
-    FileTimeToSystemTime(&about.ftLastWriteTime, &written);
-    if (!SystemTimeToTzSpecificLocalTime(nullptr, &written, &when)) {
-        FILETIME local;
-        FileTimeToLocalFileTime(&about.ftLastWriteTime, &local);
-        FileTimeToSystemTime(&local, &when);
+/* The image this code is linked into; its address is its module handle. */
+extern "C" IMAGE_DOS_HEADER __ImageBase;
+
+/* The three bytes of a UTF-8 byte-order mark. */
+static const char utf8ByteOrderMark[] = "\xEF\xBB\xBF";
+
+/* The default settingIsPresent gives GetPrivateProfileStringA. No value in a
+   settings file is this text. */
+static const char missingSettingMark[] = "\x01missing\x01";
+
+/*
+    The RCDATA resource DEFAULT_SETTINGS of module, less a UTF-8 byte-order
+    mark at its start: *length bytes, not ended by a zero. nullptr, with 0 in
+    *length, where module holds no such resource or it holds nothing more.
+*/
+static const char* defaultSettingsText(HMODULE module, DWORD* length) {
+    *length = 0;
+    const HRSRC found = FindResourceA(module, "DEFAULT_SETTINGS",
+                                      (LPCSTR)RT_RCDATA);
+    const HGLOBAL loaded = found ? LoadResource(module, found) : nullptr;
+    const char* text = loaded ? (const char*)LockResource(loaded) : nullptr;
+    if (!text) return nullptr;
+    DWORD size = SizeofResource(module, found);
+    if (size >= 3 && memcmp(text, utf8ByteOrderMark, 3) == 0) {
+        text += 3;
+        size -= 3;
     }
-    char destination[MAX_PATH];
-    sprintf_s(destination, "%s\\%s_%04u%02u%02u_%02u%02u%02u.log", archive,
-              pluginBaseName, (unsigned)when.wYear, (unsigned)when.wMonth,
-              (unsigned)when.wDay, (unsigned)when.wHour, (unsigned)when.wMinute,
-              (unsigned)when.wSecond);
-    MoveFileA(global_logPath, destination);
+    if (!size) return nullptr;
+    *length = size;
+    return text;
 }
 
-static void emptyLog() {
-    archiveLog();
-    FILE* f = nullptr;
-    if (fopen_s(&f, global_logPath, "w") == 0 && f) fclose(f);
+/*
+    1 where the settings file at path holds key in section, whatever its
+    value, an empty one included; 0 where Windows reports the key absent
+    (ERROR_FILE_NOT_FOUND, which also stands for no such section and no such
+    file); -1 where the file could not be read, for example while another
+    program holds it open without read sharing (ERROR_SHARING_VIOLATION),
+    with the error in GetLastError.
+*/
+static int settingIsPresent(const char* path, const char* section,
+                            const char* key) {
+    char held[sizeof(missingSettingMark) + 1];
+    SetLastError(0);
+    GetPrivateProfileStringA(section, key, missingSettingMark, held,
+                             (DWORD)sizeof(held), path);
+    const DWORD error = GetLastError();
+    if (strcmp(held, missingSettingMark) != 0) return 1;
+    if (error == ERROR_FILE_NOT_FOUND) return 0;
+    SetLastError(error);
+    return -1;
+}
+
+/* One setting of the default settings: its section, key and value, each
+   without the blanks at its ends. */
+struct DefaultSetting {
+    char section[256];
+    char key[256];
+    char value[512];
+};
+
+/* The text from first up to last, without the blanks at its ends, copied
+   into out with a zero after it. Answers 0, with out empty, where it does not
+   fit in room. */
+static int copyTrimmed(char* out, size_t room, const char* first,
+                       const char* last) {
+    while (first < last && (*first == ' ' || *first == '\t')) ++first;
+    while (last > first && (last[-1] == ' ' || last[-1] == '\t')) --last;
+    out[0] = 0;
+    if ((size_t)(last - first) >= room) return 0;
+    memcpy(out, first, (size_t)(last - first));
+    out[last - first] = 0;
+    return 1;
+}
+
+/*
+    The next setting of the default settings text from *at up to end, read
+    into setting, with *at moved past its line. Answers 0 once no setting is
+    left. setting->section is empty before the first call and then holds the
+    section last opened. A line with no =, a setting before the first section
+    or below a [ line with no ], and a line too long for setting are passed
+    over.
+*/
+static int nextDefaultSetting(const char** at, const char* end,
+                              DefaultSetting* setting) {
+    while (*at < end) {
+        const char* first = *at;
+        const char* last = first;
+        while (last < end && *last != '\r' && *last != '\n') ++last;
+        *at = last;
+        while (*at < end && (**at == '\r' || **at == '\n')) ++*at;
+
+        while (first < last && (*first == ' ' || *first == '\t')) ++first;
+        if (first == last || *first == ';') continue;
+        if (*first == '[') {
+            const char* close = (const char*)memchr(first, ']',
+                                                    (size_t)(last - first));
+            if (!close
+                || !copyTrimmed(setting->section, sizeof(setting->section),
+                                first + 1, close))
+                setting->section[0] = 0;
+            continue;
+        }
+        const char* equals = (const char*)memchr(first, '=',
+                                                 (size_t)(last - first));
+        if (!setting->section[0] || !equals
+            || !copyTrimmed(setting->key, sizeof(setting->key), first, equals)
+            || !setting->key[0]
+            || !copyTrimmed(setting->value, sizeof(setting->value), equals + 1,
+                            last))
+            continue;
+        return 1;
+    }
+    return 0;
+}
+
+/*
+    Adds to the settings file at path each setting of the default settings
+    text (length bytes) that Windows reports absent from it, in its section
+    with its default value, through WritePrivateProfileStringA. A setting the
+    file holds, an empty value included, and every other line of the file
+    are left as they are. Stops at the first setting that cannot be looked up
+    or added, with one line in the log.
+*/
+static void addMissingSettings(const char* path, const char* text,
+                               DWORD length) {
+    const char* at = text;
+    DefaultSetting setting = {};
+    while (nextDefaultSetting(&at, text + length, &setting)) {
+        const int present = settingIsPresent(path, setting.section,
+                                             setting.key);
+        if (present > 0) continue;
+        if (present < 0) {
+            const DWORD error = GetLastError();
+            writeLog("SETTINGS %s could not be read (Windows error %lu), so "
+                     "[%s] %s and the settings after it were not looked up, "
+                     "and those it lacks take their default values", path,
+                     error, setting.section, setting.key);
+            return;
+        }
+        if (!WritePrivateProfileStringA(setting.section, setting.key,
+                                        setting.value, path)) {
+            const DWORD error = GetLastError();
+            writeLog("SETTINGS [%s] %s could not be added to %s (Windows error "
+                     "%lu), so it and the settings after it that the file "
+                     "lacks take their default values", setting.section,
+                     setting.key, path, error);
+            return;
+        }
+    }
+}
+
+/*
+    Gives the settings file at path the default settings built into module:
+    - no file, or an empty one (0 bytes): the text whole, comments included,
+      written to <path>.new, which is flushed, closed and moved to path. The
+      move never replaces a file. An empty file is first deleted, through a
+      handle no other may share, and only while that handle shows it empty;
+      an empty file that cannot be deleted is left as it is. Where a file is
+      at path at the time of the move, the .new file is deleted and the
+      settings that file lacks are added instead.
+    - a file that starts with a UTF-8 byte-order mark: nothing.
+    - any other file: each setting it lacks, added by addMissingSettings.
+    Each failure writes one line to the log; a .new file this wrote is
+    deleted after one.
+*/
+static void writeDefaultSettings(HMODULE module, const char* path) {
+    if (!path || !path[0]) return;
+    DWORD length = 0;
+    const char* const text = defaultSettingsText(module, &length);
+    if (!text) {
+        writeLog("SETTINGS the default settings are not built into this DLL, "
+                 "so none were written to %s", path);
+        return;
+    }
+
+    /* The file's size and first three bytes, read under a shared lock on the
+       whole file, which waits while WritePrivateProfileStringA writes it. */
+    int empty = 0;
+    const HANDLE file = CreateFileA(path, GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE
+                                        | FILE_SHARE_DELETE,
+                                    nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND) {
+            writeLog("SETTINGS %s could not be read (Windows error %lu), so "
+                     "no settings were added to it, and those it lacks take "
+                     "their default values", path, error);
+            return;
+        }
+    } else {
+        OVERLAPPED whole = {};
+        LARGE_INTEGER size = {};
+        char first[3] = {};
+        DWORD got = 0;
+        const BOOL locked = LockFileEx(file, 0, 0, MAXDWORD, MAXDWORD, &whole);
+        const BOOL looked = locked && GetFileSizeEx(file, &size)
+                            && ReadFile(file, first, (DWORD)sizeof(first),
+                                        &got, nullptr);
+        const DWORD error = looked ? ERROR_SUCCESS : GetLastError();
+        if (locked) UnlockFileEx(file, 0, MAXDWORD, MAXDWORD, &whole);
+        CloseHandle(file);
+        if (!looked) {
+            writeLog("SETTINGS %s could not be read (Windows error %lu), so "
+                     "no settings were added to it, and those it lacks take "
+                     "their default values", path, error);
+            return;
+        }
+        if (size.QuadPart > 0) {
+            if (got == sizeof(first)
+                && memcmp(first, utf8ByteOrderMark, sizeof(first)) == 0)
+                writeLog("SETTINGS %s starts with a UTF-8 byte-order mark, "
+                         "which Windows reads as part of its first line, so no "
+                         "settings were added to it", path);
+            else
+                addMissingSettings(path, text, length);
+            return;
+        }
+        empty = 1;
+    }
+
+    char newPath[MAX_PATH];
+    if (_snprintf_s(newPath, sizeof(newPath), _TRUNCATE, "%s.new", path) < 0) {
+        writeLog("SETTINGS %s is too long a path to write the default "
+                 "settings beside it", path);
+        return;
+    }
+    const HANDLE out = CreateFileA(newPath, GENERIC_WRITE, 0, nullptr,
+                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL,
+                                   nullptr);
+    if (out == INVALID_HANDLE_VALUE) {
+        const DWORD error = GetLastError();
+        writeLog("SETTINGS %s could not be made (Windows error %lu), so the "
+                 "default settings were not written to %s", newPath, error,
+                 path);
+        return;
+    }
+    DWORD written = 0;
+    DWORD error = ERROR_SUCCESS;
+    if (!WriteFile(out, text, length, &written, nullptr)) error = GetLastError();
+    else if (written != length) error = ERROR_WRITE_FAULT;
+    else if (!FlushFileBuffers(out)) error = GetLastError();
+    if (!CloseHandle(out) && error == ERROR_SUCCESS) error = GetLastError();
+
+    if (error == ERROR_SUCCESS) {
+        /* Why an empty file at path stays: ERROR_SUCCESS where it was
+           deleted, is gone, or holds something by now. */
+        DWORD kept = ERROR_SUCCESS;
+        if (empty) {
+            const HANDLE old = CreateFileA(path, DELETE | FILE_READ_ATTRIBUTES,
+                                           0, nullptr, OPEN_EXISTING,
+                                           FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (old == INVALID_HANDLE_VALUE) {
+                if (GetLastError() != ERROR_FILE_NOT_FOUND) kept = GetLastError();
+            } else {
+                LARGE_INTEGER size = {};
+                FILE_DISPOSITION_INFO gone = { TRUE };
+                if (GetFileSizeEx(old, &size) && size.QuadPart == 0
+                    && !SetFileInformationByHandle(old, FileDispositionInfo,
+                                                   &gone, (DWORD)sizeof(gone)))
+                    kept = GetLastError();
+                CloseHandle(old);
+            }
+        }
+        if (kept != ERROR_SUCCESS) {
+            DeleteFileA(newPath);
+            writeLog("SETTINGS %s is empty and could not be replaced (Windows "
+                     "error %lu), so the default settings were not written to "
+                     "it, and the settings take their default values", path,
+                     kept);
+            return;
+        }
+        if (MoveFileExA(newPath, path, 0)) return;
+        error = GetLastError();
+    }
+    DeleteFileA(newPath);
+    if (error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS) {
+        addMissingSettings(path, text, length);
+        return;
+    }
+    writeLog("SETTINGS the default settings could not be written to %s "
+             "(Windows error %lu), so the settings take their default values",
+             path, error);
 }
 
 /* ------------------------------------------------------------ engine calls */
 
-static const char* const pushPageSignature =
-    "class Menu2::Page *__cdecl Menu2::PageStack::PushPage(const char *,const struct Menu2::PageParams &)";
 static const char* const listenerUpdateSignature =
     "void __cdecl ScriptManager::ListenerUpdate(void)";
 
@@ -252,11 +570,15 @@ static uint64_t global_moduleBase = 0;
 static uint64_t global_textBase = 0;
 static uint64_t global_textSize = 0;
 
-/* FNV-1a 64. Every name the engine keeps as an id is this hash of the name. */
-static uint64_t hashText(const char* text) {
+/* FNV-1a 64. Every name the engine keeps as an id is this hash of the name.
+   folded hashes the text as if its letters A to Z were written in lower
+   case. */
+static uint64_t hashText(const char* text, int folded = 0) {
     uint64_t hash = 0xCBF29CE484222325ull;
     for (const unsigned char* at = (const unsigned char*)text; *at; ++at) {
-        hash ^= (uint64_t)*at;
+        const unsigned char ch = folded && *at >= 'A' && *at <= 'Z'
+                               ? (unsigned char)(*at - 'A' + 'a') : *at;
+        hash ^= (uint64_t)ch;
         hash *= 0x100000001B3ull;
     }
     return hash;
@@ -272,6 +594,111 @@ static uint64_t callEngine(uint64_t function, uint64_t argument,
     GUARD_TRY { answer = ((WidgetOfWidgetFn)function)(argument); }
     GUARD_EXCEPT_DESCRIBING(during) { answer = 0; }
     return answer;
+}
+
+/* ------------------------------------------------------ the game's builds */
+
+/*
+    Code of the game the framework compares before it uses it: the length
+    bytes expected at rva. rva 0: none in that build.
+
+    jumpLength, for code the framework hooks: how many of the opening bytes
+    the loader replaces with its jump where another plugin has hooked the
+    same place first (E9 and its 32-bit displacement, then 90 up to
+    jumpLength); the bytes after them are still compared. 0 for code that is
+    only called or compared.
+*/
+struct ExpectedCode {
+    uint64_t       rva;
+    const uint8_t* bytes;
+    size_t         length;
+    size_t         jumpLength;
+};
+
+struct TextLookupEnd;
+
+/*
+    What the framework needs of one build of the game, chosen by the
+    executable's time stamp (installHooks). Every address is an rva.
+
+        asComponent         (widget) -> it as a Menu2 component, or 0
+        parentWidget        (widget) -> its parent widget
+        handleResolve       compared only: a handle's widget, answered only
+                            where the widget at rowId holds the handle's id
+        firstChildWidget    compared only: passes over a child whose byte at
+                            rowState has ROW_DEAD set
+        focusHolder         compared only: (menu root) -> the component that
+                            holds the focus, which hasFocus asks; rva 0 where
+                            hasFocus reads the focus itself
+        hasFocus            (component) -> a byte, not 0 where it holds the
+                            menu's focus
+        componentEvent      (component, event id, sixteen bytes*, sixteen
+                            bytes*)
+        resetPage           Page::ResetToDefaults(page), hooked
+        sourcePool          the data source pool's descriptor
+        textLookup          where the game's text lookup ends
+        rowRecord, rowId, rowState
+                            a widget's heap record, its id (32 bits), and the
+                            byte whose bit ROW_DEAD is set once it is killed
+        widgetGetDataSource, widgetRefreshSource
+                            in a component's table: its data source (row),
+                            and drawing again from it (row, 0)
+        hiddenSlot to valuePointerSlot
+                            the data source table's slots the framework
+                            answers besides those the same in every build
+                            (OUR_ITEM_DATA_SLOT and the others beside it)
+        sliderTableSlots, selectorTableSlots
+                            how many slots the slider's and the selector's
+                            own tables hold
+        safeFrameworkSources
+                            how many settings of ours fit in the data source
+                            pool as the game makes it; 0 where none is made
+                            unless the pool is enlarged
+        keybinds            1 where a Keybind control's key can be set from
+                            its row: the keybind addresses (SEND_EVENT_RVA and
+                            those beside it) are this build's. 0 where its row
+                            only shows the key (keybindsCanBeSet)
+*/
+struct GameBuild {
+    uint32_t             stamp;
+    const char*          name;
+    ExpectedCode         asComponent;
+    ExpectedCode         parentWidget;
+    ExpectedCode         handleResolve;
+    ExpectedCode         firstChildWidget;
+    ExpectedCode         focusHolder;
+    ExpectedCode         hasFocus;
+    ExpectedCode         componentEvent;
+    ExpectedCode         resetPage;
+    uint64_t             sourcePool;
+    const TextLookupEnd* textLookup;
+    unsigned             rowRecord;
+    unsigned             rowId;
+    unsigned             rowState;
+    unsigned             widgetGetDataSource;
+    unsigned             widgetRefreshSource;
+    int                  hiddenSlot;
+    int                  availabilitySlot;
+    int                  labelSlot;
+    int                  descriptionSlot;
+    int                  dependencyTextSlot;
+    int                  valueRangeSlot;
+    int                  valuePointerSlot;
+    int                  sliderTableSlots;
+    int                  selectorTableSlots;
+    int                  safeFrameworkSources;
+    int                  keybinds;
+};
+
+/* The build installHooks found the game to be, or nullptr while the
+   framework does nothing in the game. */
+static const GameBuild* global_game = nullptr;
+
+/* Whether a Keybind control's key can be set from its row in this build. Where
+   it cannot, the row is a selector of one option, the key's name, and the
+   framework never writes the key (keyShownOnly). */
+static int keybindsCanBeSet() {
+    return global_game && global_game->keybinds;
 }
 
 /* --------------------------------------------------------- json documents */
@@ -303,62 +730,23 @@ static uint64_t callEngine(uint64_t function, uint64_t argument,
 #define MAX_DOCUMENT_DEPTH   64
 #define MAX_DOCUMENT_ENTRIES 262144
 
-/* ----------------------------------------------------------- the callbacks */
-
-/* The name of the last page pushed, or of the page under one drawn over it. */
-static char global_lastPageName[64];
-
-/* The labels of one page, written into the text cache again. */
-static void registerPageTexts(const char* onPage);
-
-/* Finds and enlarges the text cache, retried until the game's text database is
-   loaded. */
-static void ensureTextCache(void);
-
-static uint64_t topPageOf(uint64_t stack);
-static const char* pageNameOf(uint64_t page);
-
-/*
-    A page drawn over the open page rather than opened in its own right. The
-    open page stays the one whose labels are kept and whose name the log gives.
-*/
-static int drawsOverThePage(const char* name) {
-    if (!name || !name[0]) return 0;
-    return _strnicmp(name, "menu/message-box", 16) == 0
-        || _strnicmp(name, "menu/page-drop-down", 19) == 0;
-}
-
-/* PushPage: rcx the PageStack, rdx the page name as text, r8 the PageParams. */
-static void pushPageHook(void* registers, void*) {
-    char name[64];
-    copyText(name, sizeof(name), loaderHookRegister(registers, LOADER_REG_RDX));
-    if (drawsOverThePage(name)) {
-        const char* below = pageNameOf(
-            topPageOf(loaderHookRegister(registers, LOADER_REG_RCX)));
-        if (below)
-            strcpy_s(global_lastPageName, sizeof(global_lastPageName), below);
-        registerPageTexts(global_lastPageName);
-        return;
-    }
-    strcpy_s(global_lastPageName, sizeof(global_lastPageName), name);
-    registerPageTexts(name);
-}
-
-/* Every tick: make sure the text cache is found - the game may load its text
-   database after the framework started - then the labels of the open page go
-   back into it. */
-static void keybindTick(void);
-
-static void listenerUpdateHook(void*, void*) {
-    ensureTextCache();
-    registerPageTexts(global_lastPageName);
-    keybindTick();
-}
-
 /* The longest widget file name, and the longest data source name, both as the
    engine writes them. */
 #define MAX_WIDGET_NAME  96
 #define MAX_SOURCE_NAME  128
+
+/* ----------------------------------------------------------- the callbacks */
+
+/* Every tick: the values put aside for a settings file its mod has written
+   since the framework started are forgotten (forgetPutAsideOfWrittenFiles),
+   and the keybinds' cells are kept (keybindTick). */
+static void keybindTick(void);
+static void forgetPutAsideOfWrittenFiles(void);
+
+static void listenerUpdateHook(void*, void*) {
+    forgetPutAsideOfWrittenFiles();
+    keybindTick();
+}
 
 /* --------------------------------------------------- the widget file reader */
 
@@ -442,17 +830,15 @@ static uint64_t findWidgetFileReader() {
     }
     uint8_t* site = soleCallSite(animations);
     if (!site) {
-        writeLog("FILE Gui2::WidgetFile::LoadAnimations at rva %08X is not "
-                 "called exactly once, so the reader cannot be located",
-                 (unsigned int)(animations - global_moduleBase));
+        writeLog("FILE Gui2::WidgetFile::LoadAnimations is not called exactly "
+                 "once, so the reader cannot be located");
         return 0;
     }
     uint8_t* start = functionStartBefore(site);
     if (!start)
-        writeLog("FILE no padding in front of the call at rva %08X within %d "
-                 "bytes, so the reader cannot be located",
-                 (unsigned int)((uint64_t)site - global_moduleBase),
-                 READER_SEARCH_BACK);
+        writeLog("FILE no padding in front of the call to "
+                 "Gui2::WidgetFile::LoadAnimations within %d bytes, so the "
+                 "reader cannot be located", READER_SEARCH_BACK);
     return (uint64_t)start;
 }
 
@@ -606,7 +992,7 @@ static char* readWholeFile(const char* path, uint32_t largest, const char* tag,
                            const char* shown, uint32_t* length) {
     FILE* f = nullptr;
     if (fopen_s(&f, path, "rb") != 0 || !f) {
-        writeLog("%s could not open %s", tag, path);
+        writeLog("%s could not open %s", tag, shown);
         return 0;
     }
     fseek(f, 0, SEEK_END);
@@ -626,11 +1012,30 @@ static char* readWholeFile(const char* path, uint32_t largest, const char* tag,
     return text;
 }
 
-static void readMenuFolder(const char* folder, const char* prefix, int depth) {
+/*
+    Every .json file in folder and in the folders inside it, eight levels down
+    at most, kept under prefix and its name without the extension, so that
+    mods\page-x.json is kept as mods/page-x. A file or a folder whose full
+    path, or whose name kept that way, does not fit is left out with a line: a
+    name kept has room for the MAX_WIDGET_NAME - 1 characters of a widget
+    file's name. top is what the log calls the folder first read. A line
+    names the file or folder it is about by its path inside that folder,
+    which is prefix and its own name, followed by " in " and top, as in
+    "mods/page-x.json in Mod Menus"; the folder first read is named by top
+    alone.
+*/
+static void readMenuFolder(const char* folder, const char* prefix, int depth,
+                           const char* top) {
     if (depth > 8) return;
 
     char pattern[MAX_PATH];
-    sprintf_s(pattern, "%s\\*", folder);
+    if (!formatInto(pattern, sizeof(pattern), "%s\\*", folder)) {
+        writeLog("MENU %.*s%s%s: its full path is too long for Windows to list "
+                 "the files in it, so the folder was not read",
+                 prefix[0] ? (int)strlen(prefix) - 1 : 0, prefix,
+                 prefix[0] ? " in " : "", top);
+        return;
+    }
     WIN32_FIND_DATAA found;
     HANDLE search = FindFirstFileA(pattern, &found);
     if (search == INVALID_HANDLE_VALUE) return;
@@ -638,35 +1043,59 @@ static void readMenuFolder(const char* folder, const char* prefix, int depth) {
     do {
         if (found.cFileName[0] == '.') continue;
 
-        char path[MAX_PATH];
-        sprintf_s(path, "%s\\%s", folder, found.cFileName);
-
-        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            char inner[MAX_SOURCE_NAME];
-            sprintf_s(inner, "%s%s/", prefix, found.cFileName);
-            readMenuFolder(path, inner, depth + 1);
-            continue;
-        }
-
+        const int isFolder =
+            (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
         const char* extension = strrchr(found.cFileName, '.');
-        if (!extension || _stricmp(extension, ".json") != 0) continue;
-        if (global_menuFileCount >= MAX_MENU_FILES) {
-            writeLog("MENU the table holds %d file(s), so %s was not read",
-                     MAX_MENU_FILES, found.cFileName);
+        if (!isFolder && (!extension || _stricmp(extension, ".json") != 0))
+            continue;
+
+        char path[MAX_PATH];
+        if (!formatInto(path, sizeof(path), "%s\\%s", folder,
+                        found.cFileName)) {
+            writeLog("MENU %s%s in %s: its full path is longer than the %d "
+                     "characters Windows allows, so it was not read", prefix,
+                     found.cFileName, top, MAX_PATH - 1);
             continue;
         }
+
+        if (isFolder) {
+            char inner[MAX_WIDGET_NAME];
+            if (!formatInto(inner, sizeof(inner), "%s%s/", prefix,
+                            found.cFileName)) {
+                writeLog("MENU %s%s in %s: the names of the files inside it "
+                         "would be longer than the %d characters a widget "
+                         "file's name can have, so the folder was not read",
+                         prefix, found.cFileName, top, MAX_WIDGET_NAME - 1);
+                continue;
+            }
+            readMenuFolder(path, inner, depth + 1, top);
+            continue;
+        }
+
+        if (global_menuFileCount >= MAX_MENU_FILES) {
+            writeLog("MENU the table holds %d file(s), so %s%s in %s was not "
+                     "read", MAX_MENU_FILES, prefix, found.cFileName, top);
+            continue;
+        }
+        MenuFile* entry = &global_menuFiles[global_menuFileCount];
+        memset(entry, 0, sizeof(*entry));
+        if (!formatInto(entry->name, MAX_WIDGET_NAME, "%s%.*s", prefix,
+                        (int)(extension - found.cFileName), found.cFileName)) {
+            writeLog("MENU %s%s in %s: its name would be longer than the %d "
+                     "characters a widget file's name can have, so it was not "
+                     "read", prefix, found.cFileName, top, MAX_WIDGET_NAME - 1);
+            continue;
+        }
+        char named[MAX_WIDGET_NAME + MAX_PATH * 2 + 8];
+        formatInto(named, sizeof(named), "%s%s in %s", prefix, found.cFileName,
+                   top);
         uint32_t length = 0;
-        char* text = readWholeFile(path, MAX_MENU_BYTES, "MENU", found.cFileName,
-                                   &length);
+        char* text = readWholeFile(path, MAX_MENU_BYTES, "MENU", named, &length);
         if (!text) continue;
 
-        MenuFile* entry = &global_menuFiles[global_menuFileCount++];
-        memset(entry, 0, sizeof(*entry));
-        sprintf_s(entry->name, "%s%s", prefix, found.cFileName);
-        char* dot = strrchr(entry->name, '.');
-        if (dot) *dot = 0;
         entry->text = text;
         entry->length = length;
+        ++global_menuFileCount;
     } while (FindNextFileA(search, &found));
     FindClose(search);
 }
@@ -688,16 +1117,14 @@ static void readMenuFolder(const char* folder, const char* prefix, int depth) {
 #define TEMPLATE_FOLDER   "Game Menus\\Menu Templates"
 #define MENUPAGE_SUFFIX   ".menupage"
 
-/* <plugin folder>\<leaf>, taken from the log path: the folder above the one
-   the log is in. */
+/* <plugin folder>\<leaf>, taken from the log path: the folder the log is
+   in. */
 static int pluginSubfolder(char* out, size_t size, const char* leaf) {
     if (!global_logPath[0]) return 0;
     strcpy_s(out, size, global_logPath);
-    for (int up = 0; up < 2; ++up) {
-        char* slash = strrchr(out, '\\');
-        if (!slash) return 0;
-        *slash = 0;
-    }
+    char* slash = strrchr(out, '\\');
+    if (!slash) return 0;
+    *slash = 0;
     strcat_s(out, size, "\\");
     strcat_s(out, size, leaf);
     return 1;
@@ -707,9 +1134,9 @@ static void loadMenuFiles() {
     prepareHexKeys();
     char folder[MAX_PATH];
     if (pluginSubfolder(folder, sizeof(folder), MOD_MENU_FOLDER))
-        readMenuFolder(folder, "", 0);
+        readMenuFolder(folder, "", 0, MOD_MENU_FOLDER);
     if (pluginSubfolder(folder, sizeof(folder), TEMPLATE_FOLDER))
-        readMenuFolder(folder, "", 0);
+        readMenuFolder(folder, "", 0, TEMPLATE_FOLDER);
 }
 
 /* The file held under the game's own name for it, or nothing. */
@@ -969,9 +1396,9 @@ static uint64_t parseMenuFile(MenuFile* menu, const char* widgetName) {
 
     menu->document = global_parseSlot[0];
     if (!ok || !menu->document) {
-        writeLog("MENU %s %s, %u byte(s), returned %016llx", menu->name,
-                 ok ? "parsed" : "faulted", menu->length,
-                 (unsigned long long)menu->document);
+        writeLog("MENU %s, %u byte(s), %s", menu->name, menu->length,
+                 ok ? "gave no document when it was parsed"
+                    : "faulted when it was parsed");
         return 0;
     }
     GUARD_TRY { restoreHexKeys(menu->document, 0); } GUARD_EXCEPT { }
@@ -1032,6 +1459,12 @@ static int textIsExpression(const char* text, int page);
 */
 #define MODPAGE_EXPRESSION    2048
 #define MAX_MODPAGE_BYTES     (10u * 1024u * 1024u)
+
+/* Room for a setting's title, its option labels and values, its list value,
+   the value its row shows and its default, and for its description and its
+   dependency description. A text a block writes is cut to fit. */
+#define MAX_SETTING_TEXT      128
+#define MAX_DESCRIPTION_TEXT  1024
 
 #define ITEM_NONE             0
 #define ITEM_CONTROL          1
@@ -1100,8 +1533,14 @@ struct ModPageItem {
     int   pageIndex;       /* where the row draws, 0 when the file did not say */
     char  pageIndexSetting[MODPAGE_NAME]; /* the control that carries the index */
     int   inherited;       /* INHERIT_ bits that said InheritFromParent */
-    /* A key this format has no meaning for was found in the block, so the
-       block draws nothing and makes no setting. */
+    /* The block was skipped when it was read, with a line in the log: it
+       names no ItemType, or holds a key, an ItemType or a ControlType this
+       format has no meaning for, or a key its ControlType does not take; it
+       would make a control with an empty option or none to choose, a List
+       inside a List, or a ListControl that adds nothing to its List; its
+       ModPage is too long; or it is linked to a block that was skipped. It
+       draws nothing and makes no setting, and no block inside it makes
+       one. */
     int   refused;
     int   optionCount;
     float least, greatest, step;
@@ -1136,9 +1575,16 @@ struct ModPageItem {
        action outside the menus. 1 and 0 where the file does not say. */
     int   allowMenuKeys;
     int   allowGameplayKeys;
+    /* Which of ToggleDisabledValue (1) and ToggleEnabledValue (2) the block
+       gives with a label, as bits. One written with an empty label counts as
+       not given, and is among emptyToggleKeys, as the same bits. */
+    int   toggleKeys;
+    int   emptyToggleKeys;
     /* A preset: its first preset in global_preset; its options are the
        presets, then the one that stands for settings that match none. */
     int   firstPreset;
+    /* Its Off preset (PresetOff) in global_preset, plus 1; 0 for none. */
+    int   offPreset;
     ModPageOption option[MAX_MODPAGE_OPTIONS];
 };
 
@@ -1153,12 +1599,27 @@ struct ModPage {
     int  ofTheGame;                   /* read from Game Menus */
     char storePath[MAX_PATH];
     int  firstItem, itemCount;
+    /* The file was read with no fault and no block of it was skipped. */
+    int  loadedWhole;
 };
 
 static ModPage     global_modPages[MAX_MODPAGE_FILES];
 static int         global_modPageCount = 0;
 static ModPageItem global_modItems[MAX_MODPAGE_ITEMS];
 static int         global_modItemCount = 0;
+
+/*
+    What the pages read leave unknown about the settings the controls reach:
+    global_reachUnknown is 1 where a menupage was not read; where a page,
+    loaded or not, was read with a fault other than a block nested too deep
+    and names no ConfigurationFile; where more pages were read but not loaded
+    than global_refusedPagePath has room for; or where a control was left out
+    for room. global_refusedPagePath holds the settings file of each page that
+    was read but not loaded, empty for a page that names none.
+*/
+static int  global_reachUnknown = 0;
+static char global_refusedPagePath[MAX_MODPAGE_FILES][MAX_PATH];
+static int  global_refusedPageCount = 0;
 
 /*
     A key kept as text: the field it goes in, the bit that says it was taken
@@ -1200,9 +1661,9 @@ static const TextKey global_itemTextKey[] = {
 
 static const TextKey global_pageTextKey[] = {
     { { "DefineMenuPage" }, PAGE_FIELD(title), 0, "page title" },
-    { { "ConfigurationFile" }, PAGE_FIELD(settingsFile), 0, "settings file" },
-    { { "ReplacesPage" }, PAGE_FIELD(replacesPage), 0, "replaced page" },
-    { { "MenuTemplate" }, PAGE_FIELD(menuTemplate), 0, "menu template" },
+    { { "ConfigurationFile" }, PAGE_FIELD(settingsFile), 0, "settings file name" },
+    { { "ReplacesPage" }, PAGE_FIELD(replacesPage), 0, "replaced page name" },
+    { { "MenuTemplate" }, PAGE_FIELD(menuTemplate), 0, "menu template name" },
 };
 
 /* The key of keys named name, or nothing. */
@@ -1293,12 +1754,20 @@ static int nameCanBeGiven(const char* name, size_t length) {
         && !wordIsReserved(name, length);
 }
 
-/* Where the reader is up to, and the file it is reading, for the log. */
+/*
+    Where the reader is up to, and the file it is reading, for the log.
+
+    depth    how many blocks the reader is inside
+    tooDeep  a block nested deeper than MODPAGE_DEPTH was found and stepped
+             over unread, so the page is not kept
+*/
 struct ModPageCursor {
     const char* at;
     const char* end;
     const char* name;
     int         faults;
+    int         depth;
+    int         tooDeep;
 };
 
 static void modPageFault(ModPageCursor* c, const char* fmt, ...) {
@@ -1361,9 +1830,61 @@ static void readBracketed(ModPageCursor* c, char* out, size_t room) {
 }
 
 /*
+    How deep blocks may nest. A block in a page's Content is one deep, and a
+    block in the Content or ListItems of another, or linked to it, one deeper
+    than that one. Each level takes the reader about 10 KB of stack, so the
+    deepest page takes about 170 KB. A submenu is a block, so submenus nest no
+    deeper than this either; generateOnePage takes about 11 KB for each, so
+    drawing the pages of the deepest page takes about 210 KB.
+*/
+#define MODPAGE_DEPTH  16
+
+/*
+    Steps over the block at the cursor, from its '{' to the '}' that closes it,
+    without reading it. A brace between '[' and the ']' that closes it belongs
+    to a value and is not counted.
+*/
+static void stepOverBlock(ModPageCursor* c) {
+    int braces = 0, brackets = 0;
+    for (; c->at < c->end; ++c->at) {
+        const char ch = *c->at;
+        if (ch == '[') ++brackets;
+        else if (ch == ']') { if (brackets) --brackets; }
+        else if (brackets) continue;
+        else if (ch == '{') ++braces;
+        else if (ch == '}' && --braces <= 0) { ++c->at; return; }
+    }
+}
+
+/*
+    One level deeper, for the block at the cursor, before it is read or stepped
+    over. Answers 1 where the block is within MODPAGE_DEPTH, and the caller
+    takes the level off again once the block is done. Answers 0 where it is
+    deeper: the level is not counted, the block has been stepped over unread
+    and the page is marked to be refused, and the first such block of the page
+    is logged.
+*/
+static int enterBlock(ModPageCursor* c) {
+    if (c->depth < MODPAGE_DEPTH) {
+        ++c->depth;
+        return 1;
+    }
+    if (!c->tooDeep)
+        modPageFault(c, "blocks are nested more than %d deep, so this page was "
+                        "not loaded", MODPAGE_DEPTH);
+    c->tooDeep = 1;
+    stepOverBlock(c);
+    return 0;
+}
+
+/*
     Stepping over what readBlockList and readBlock read, without keeping it:
     a value, from its '[' to the ']' that closes it or a linked block written
-    '[{' ... '}]', a block, and a list of blocks.
+    '[{' ... '}]', a block, and a list of blocks. skipBlock counts the level of
+    its block itself, with enterBlock. skipBlockList answers 1 where it
+    reached the '}' that closes the list, and 0 where the file ends first or
+    the list does not open with '{' or holds what is neither a block nor a
+    key.
 */
 static void skipBlock(ModPageCursor* c);
 
@@ -1384,37 +1905,38 @@ static void skipValue(ModPageCursor* c) {
         else if (*c->at == ']' && --depth == 0) { ++c->at; return; }
 }
 
-static void skipBlockList(ModPageCursor* c) {
+static int skipBlockList(ModPageCursor* c) {
     skipBlanks(c);
-    if (c->at >= c->end || *c->at != '{') return;
+    if (c->at >= c->end || *c->at != '{') return 0;
     ++c->at;
     for (;;) {
         skipBlanks(c);
-        if (c->at >= c->end) return;
-        if (*c->at == '}') { ++c->at; return; }
+        if (c->at >= c->end) return 0;
+        if (*c->at == '}') { ++c->at; return 1; }
         if (*c->at == '{') { skipBlock(c); continue; }
         char name[MODPAGE_NAME];
-        if (!readKeyName(c, name, sizeof(name))) return;
+        if (!readKeyName(c, name, sizeof(name))) return 0;
         skipValue(c);
     }
 }
 
 static void skipBlock(ModPageCursor* c) {
     skipBlanks(c);
-    if (c->at >= c->end || *c->at != '{') return;
+    if (c->at >= c->end || *c->at != '{' || !enterBlock(c)) return;
     ++c->at;
     for (;;) {
         skipBlanks(c);
-        if (c->at >= c->end) return;
-        if (*c->at == '}') { ++c->at; return; }
+        if (c->at >= c->end) break;
+        if (*c->at == '}') { ++c->at; break; }
         char name[MODPAGE_NAME];
-        if (!readKeyName(c, name, sizeof(name))) return;
+        if (!readKeyName(c, name, sizeof(name))) break;
         skipBlanks(c);
         if (!_stricmp(name, "Content") || !_stricmp(name, "ListItems"))
             skipBlockList(c);
         else
             skipValue(c);
     }
+    --c->depth;
 }
 
 static int nameCharacter(char ch);
@@ -1625,6 +2147,19 @@ static int controlTypeFromName(const char* text) {
     return -1;
 }
 
+/* What the log calls a block of controlType: the ControlType's own name, or
+   "control" where it has none. */
+static const char* nameOfControlType(int controlType) {
+    switch (controlType) {
+    case MODPAGE_TOGGLE:   return "Toggle";
+    case MODPAGE_SELECTOR: return "Selector";
+    case MODPAGE_SLIDER:   return "Slider";
+    case MODPAGE_PRESET:   return "Preset";
+    case MODPAGE_KEYBIND:  return "Keybind";
+    default:               return "control";
+    }
+}
+
 /*
     Presets: a selector whose options each set several settings at once.
 
@@ -1632,6 +2167,7 @@ static int controlTypeFromName(const char* text) {
         PresetValues: ["Default" = {corner = 3, size = 100, opacity = 70},
                        "Faint" = {size = 70, opacity = 30}]
         PresetCustomText: [Custom]
+        PresetOff: ["OFF" = {corner = 3, size = 100, opacity = 70}]
 
     Each preset is a label and, in braces, the settings it sets: a name, read
     the way an expression reads one (a control of the page, or a key in its
@@ -1646,6 +2182,13 @@ static int controlTypeFromName(const char* text) {
     what every setting the presets name holds, and choosing Custom puts those
     values back. DefaultValue, where written, is the number of the preset that
     counts as its default, for MarkAsModified.
+
+    PresetOff names one more preset, the settings' defaults, which is never
+    offered: the last option shows its label in place of Custom while every
+    setting it names holds its value, as Reset to Defaults leaves them. A
+    preset chosen from there puts nothing aside, so Custom never brings Off
+    back; only Reset to Defaults does. Where a preset has an Off, it is at its
+    default while Off holds.
 */
 #define MAX_PRESETS          256   /* presets in every menupage together */
 #define MAX_PRESET_SETTINGS  32    /* settings one preset sets */
@@ -1766,6 +2309,13 @@ static int readPresets(ModPageCursor* c, int item, const char* text) {
 
 static int readBlock(ModPageCursor* c, int parent, int page, int file);
 
+/* Whether block i, or a block holding it, was skipped when it was read. */
+static int blockIsSkipped(int i) {
+    for (; i >= 0; i = global_modItems[i].parent)
+        if (global_modItems[i].refused) return 1;
+    return 0;
+}
+
 /* The blocks between '{' and its closing '}'. */
 static void readBlockList(ModPageCursor* c, int parent, int page, int file) {
     skipBlanks(c);
@@ -1778,7 +2328,13 @@ static void readBlockList(ModPageCursor* c, int parent, int page, int file) {
         skipBlanks(c);
         if (c->at >= c->end) { modPageFault(c, "the file ends inside a block"); return; }
         if (*c->at == '}') { ++c->at; return; }
-        if (*c->at == '{') { readBlock(c, parent, page, file); continue; }
+        if (*c->at == '{') {
+            if (enterBlock(c)) {
+                readBlock(c, parent, page, file);
+                --c->depth;
+            }
+            continue;
+        }
         /* A key among the blocks. Only ListDependency is read there. */
         char name[MODPAGE_NAME], value[MODPAGE_DEPENDENCY];
         if (!readKeyName(c, name, sizeof(name))) {
@@ -1796,8 +2352,39 @@ static void readBlockList(ModPageCursor* c, int parent, int page, int file) {
 }
 
 /*
+    How a block is named in the log: by its SettingName where the file writes
+    it as a name rather than as an expression, or else by its title where the
+    file writes the title as text rather than as an expression. The
+    three parts are written one after another, as in
+    " with SettingName \"" "brightness" "\"", and are all empty for a block
+    named by neither.
+*/
+struct BlockName {
+    const char* before;
+    const char* name;
+    const char* after;
+};
+
+static BlockName blockNameOf(const ModPageItem* block, int file) {
+    if (block->settingName[0] && !block->settingKey[0])
+        return { " with SettingName \"", block->settingName, "\"" };
+    if (block->title[0] && !textIsExpression(block->title, file))
+        return { " titled \"", block->title, "\"" };
+    return { "", "", "" };
+}
+
+/* The names of the toggle keys keys holds as the bits of
+   ModPageItem::toggleKeys: 1, 2 or both. */
+static const char* toggleKeysNamed(int keys) {
+    return keys == 1 ? "ToggleDisabledValue"
+         : keys == 2 ? "ToggleEnabledValue"
+                     : "ToggleDisabledValue and ToggleEnabledValue";
+}
+
+/*
     One block, from its '{' to its '}'. Returns the item it filled in, or -1.
     InheritFromParent is refused on ItemType, ControlType and SettingName.
+    The block's level is counted by the caller, with enterBlock.
 */
 static int readBlock(ModPageCursor* c, int parent, int page, int file) {
     skipBlanks(c);
@@ -1808,6 +2395,10 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
         modPageFault(c, "there is room for no more controls");
         return -1;
     }
+    /* The ItemType the block names, where it is not one this format has, and
+       the length of a ModPage too long for a menupage's name, or 0. */
+    char unknownType[MODPAGE_NAME] = "";
+    int longModPage = 0;
     const int me = global_modItemCount++;
     ModPageItem* item = &global_modItems[me];
     memset(item, 0, sizeof(*item));
@@ -1844,10 +2435,13 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
             while (after < c->end && (unsigned char)*after <= ' ') ++after;
             if (after < c->end && *after == '{') {
                 c->at = after;
-                const int child = readBlock(c, me, page, file);
-                if (child >= 0) {
-                    global_modItems[me].linked = child;
-                    global_modItems[child].itemType = ITEM_LINKED;
+                if (enterBlock(c)) {
+                    const int child = readBlock(c, me, page, file);
+                    --c->depth;
+                    if (child >= 0) {
+                        global_modItems[me].linked = child;
+                        global_modItems[child].itemType = ITEM_LINKED;
+                    }
                 }
                 skipBlanks(c);
                 if (c->at < c->end && *c->at == ']') ++c->at;
@@ -1860,6 +2454,16 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
             modPageFault(c, "a value fills the whole of the room there is for "
                             "one, so it may have been cut short");
 
+        /* An ItemType that is not one this format has, InheritFromParent
+           among them, is kept for the line the end of the block writes. */
+        if (!_stricmp(name, "ItemType")) {
+            item->itemType = itemTypeFromName(value);
+            formatInto(unknownType, sizeof(unknownType), "%.*s",
+                       (int)sizeof(unknownType) - 1,
+                       item->itemType == ITEM_NONE ? value : "");
+            continue;
+        }
+
         const int inherits = !_stricmp(value, INHERIT_WORD);
         /* In a dependency the word counts wherever it stands as a term of the
            expression. Everywhere else only the whole value counts. */
@@ -1867,10 +2471,10 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
                               || !_stricmp(name, "ListDependency");
         const int mentions = isDependency
                           && wordStandsIn(value, INHERIT_WORD) >= 0;
-        if (inherits && (!_stricmp(name, "ItemType") || !_stricmp(name, "ControlType")
+        if (inherits && (!_stricmp(name, "ControlType")
                          || !_stricmp(name, "SettingName"))) {
-            writeLog("MODPAGE %s: %s asks to inherit, which is refused: it is what "
-                     "makes the block what it is", c->name, name);
+            modPageFault(c, "%s asks to inherit, which is refused: it is what "
+                            "makes the block what it is", name);
             continue;
         }
         if ((inherits || mentions) && parent < 0) {
@@ -1887,7 +2491,6 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
             else copyBounded((char*)item + key->offset, key->room, value,
                              key->what);
         }
-        else if (!_stricmp(name, "ItemType"))    item->itemType = itemTypeFromName(value);
         else if (!_stricmp(name, "ControlType")) {
             item->controlType = controlTypeFromName(value);
             /* A row of a kind this framework does not draw would be drawn as
@@ -1901,7 +2504,13 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
         }
         else if (!_stricmp(name, "ModPage")) {
             /* A menupage in the mod menu folder, by file name without its
-               extension. The page it generates is named for the same stem. */
+               extension. The page it generates is named for the same stem,
+               which has room for MODPAGE_NAME - 1 characters. */
+            if (strlen(value) >= MODPAGE_NAME) {
+                item->refused = 1;
+                longModPage = (int)strlen(value);
+                continue;
+            }
             if (item->pageName[0])
                 writeLog("MODPAGE %s: ModPage \"%s\" replaces the PageName "
                          "already given", c->name, value);
@@ -1971,6 +2580,10 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
             item->firstPreset = global_presetCount;
             item->optionCount = readPresets(c, me, value);
         }
+        else if (!_stricmp(name, "PresetOff")) {
+            const int at = global_presetCount;
+            if (readPresets(c, me, value) > 0) item->offPreset = at + 1;
+        }
         else if (!_stricmp(name, "PresetCustomText"))
             /* Kept in the last option until the block ends, where the option
                after the presets takes it. */
@@ -1979,9 +2592,14 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
                         "preset custom text");
         else if (!_stricmp(name, "ToggleDisabledValue")
                  || !_stricmp(name, "ToggleEnabledValue")) {
-            readOption(value, &item->option[!_stricmp(name, "ToggleEnabledValue")],
-                       file);
-            if (item->optionCount < 2) item->optionCount = 2;
+            /* One that gives no label counts as not given. */
+            const int enabled = !_stricmp(name, "ToggleEnabledValue");
+            ModPageOption read;
+            if (readOption(value, &read, file)) {
+                item->option[enabled] = read;
+                item->toggleKeys |= enabled ? 2 : 1;
+                if (item->optionCount < 2) item->optionCount = 2;
+            } else item->emptyToggleKeys |= enabled ? 2 : 1;
         }
         else {
             /* The block goes, not the key. Every other block on the page still
@@ -1992,6 +2610,50 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
         }
     }
 
+    if (longModPage) {
+        const BlockName n = blockNameOf(item, file);
+        writeLog("MODPAGE %s: an item%s%s%s has a ModPage of %d characters, "
+                 "which is longer than the %d characters a menupage's name can "
+                 "have, so the block holding it was skipped", c->name,
+                 n.before, n.name, n.after, longModPage, MODPAGE_NAME - 1);
+    }
+
+    /* Every block names its ItemType, a linked one included: the block that
+       carries a linked control marks it linked only after it has been read,
+       so this is the ItemType the linked block names itself. A block already
+       skipped is not named again. */
+    if (item->itemType == ITEM_NONE && !item->refused) {
+        item->refused = 1;
+        const BlockName n = blockNameOf(item, file);
+        if (!_stricmp(unknownType, INHERIT_WORD))
+            writeLog("MODPAGE %s: an item%s%s%s asks to inherit its ItemType, "
+                     "which cannot be inherited: it is what makes the block "
+                     "what it is, so the block holding it was skipped",
+                     c->name, n.before, n.name, n.after);
+        else if (unknownType[0])
+            writeLog("MODPAGE %s: an item%s%s%s has ItemType \"%s\", which "
+                     "this format does not have, so the block holding it was "
+                     "skipped", c->name, n.before, n.name, n.after,
+                     unknownType);
+        else
+            writeLog("MODPAGE %s: an item%s%s%s has no ItemType, so the block "
+                     "holding it was skipped", c->name, n.before, n.name,
+                     n.after);
+    }
+
+    /* ToggleDisabledValue and ToggleEnabledValue belong to a Toggle, and to
+       a block with no ControlType, which makes one. The ControlType may be
+       written after them, so this is tested once the block is read. */
+    if (item->toggleKeys && item->controlType >= 0
+        && item->controlType != MODPAGE_TOGGLE && !item->refused) {
+        item->refused = 1;
+        const BlockName n = blockNameOf(item, file);
+        writeLog("MODPAGE %s: a %s%s%s%s has %s, which only a Toggle takes, so "
+                 "the block holding it was skipped", c->name,
+                 nameOfControlType(item->controlType), n.before, n.name,
+                 n.after, toggleKeysNamed(item->toggleKeys));
+    }
+
     /* A preset's options: the presets, then the one for settings that match
        none. It is named for its block where its page does not name it. */
     if (item->itemType == ITEM_CONTROL && item->controlType == MODPAGE_PRESET
@@ -1999,8 +2661,10 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
         const int presets = item->optionCount;
         if (presets <= 0) {
             item->refused = 1;
-            writeLog("MODPAGE %s: a Preset lists no preset in PresetValues, so "
-                     "the block holding it was skipped", c->name);
+            const BlockName n = blockNameOf(item, file);
+            writeLog("MODPAGE %s: a Preset%s%s%s lists no preset in "
+                     "PresetValues, so the block holding it was skipped",
+                     c->name, n.before, n.name, n.after);
         } else {
             char custom[MODPAGE_TITLE];
             copyBounded(custom, sizeof(custom),
@@ -2024,6 +2688,130 @@ static int readBlock(ModPageCursor* c, int parent, int page, int file) {
             if (!item->settingName[0])
                 sprintf_s(item->settingName, "preset-%d", me);
         }
+    }
+
+    /*
+        A toggle takes its options from ToggleDisabledValue and
+        ToggleEnabledValue, both of them, and a selector from SelectorValues or
+        SelectorCount; a block with no ControlType makes a toggle. A Preset
+        takes them from PresetValues alone: SelectorCount would give it
+        numbered options with no preset behind them. A toggle given only one of
+        its two values, and a block that gets no option from these, would make
+        a setting with an empty option or with nothing to choose, so the block
+        goes.
+
+        A List, a Submenu and a PageLink make no such setting. A control
+        linked to this one with [{ }] makes one whichever ItemType it names (a
+        missing or unknown one was refused when it was read), but is marked
+        linked only after it has been read, so this block checks its linked
+        controls again here. They were read after this block, so they follow
+        it in global_modItems.
+    */
+    for (int k = me; k < global_modItemCount; ++k) {
+        ModPageItem* block = &global_modItems[k];
+        if (k != me && (block->parent != me || block->itemType != ITEM_LINKED))
+            continue;
+        if (block->refused || block->itemType == ITEM_LIST
+            || block->itemType == ITEM_SUBMENU
+            || block->itemType == ITEM_PAGELINK)
+            continue;
+        const int preset = block->controlType == MODPAGE_PRESET;
+        const char* kind = nameOfControlType(block->controlType);
+        const BlockName n = blockNameOf(block, file);
+        /* A toggle key the block writes with an empty label is named as
+           written so. */
+        if ((block->controlType == MODPAGE_TOGGLE || block->controlType < 0)
+            && (block->toggleKeys == 1 || block->toggleKeys == 2)) {
+            block->refused = 1;
+            const int missing = 3 - block->toggleKeys;
+            const int empty = (block->emptyToggleKeys & missing) != 0;
+            writeLog("MODPAGE %s: a %s%s%s%s %shas %s but %s%s%s, so the block "
+                     "holding it was skipped", c->name, kind, n.before, n.name,
+                     n.after,
+                     block->controlType < 0 ? "has no ControlType, which makes "
+                                              "it a Toggle, and " : "",
+                     toggleKeysNamed(block->toggleKeys),
+                     empty ? "writes " : "no ", toggleKeysNamed(missing),
+                     empty ? " with an empty label" : "");
+            continue;
+        }
+        if ((block->controlType >= 0 && block->controlType != MODPAGE_TOGGLE
+             && block->controlType != MODPAGE_SELECTOR && !preset)
+            || block->optionCount > 0
+            || (block->optionCountExpression[0] && !preset))
+            continue;
+        block->refused = 1;
+        const int empty = block->emptyToggleKeys;
+        char toggles[160];
+        if (!empty)
+            formatInto(toggles, sizeof(toggles), "%sneither ToggleDisabledValue "
+                       "nor ToggleEnabledValue",
+                       block->controlType == MODPAGE_TOGGLE ? "has " : "");
+        else
+            formatInto(toggles, sizeof(toggles), "writes %s with an empty "
+                       "label%s%s", toggleKeysNamed(empty),
+                       empty == 3 ? "" : " and has no ",
+                       empty == 3 ? "" : toggleKeysNamed(3 - empty));
+        writeLog("MODPAGE %s: a %s%s%s%s %s%s, so the block holding it was "
+                 "skipped", c->name, kind, n.before, n.name, n.after,
+                 preset ? "lists no preset in PresetValues"
+                 : block->controlType == MODPAGE_SELECTOR
+                     ? "lists no option in SelectorValues and has no "
+                       "SelectorCount"
+                 : block->controlType == MODPAGE_TOGGLE ? ""
+                 : "has no ControlType it can use, which makes it a Toggle, "
+                   "and ",
+                 preset || block->controlType == MODPAGE_SELECTOR ? ""
+                                                                  : toggles);
+    }
+
+    /*
+        A List draws a row for each of its own ListItems and none for the
+        ListItems of a List among them, which would show as a row bound to
+        that List. The blocks read inside a block at the top of the page are
+        looked at once it is read, each after the block holding it, so that a
+        List inside one already skipped is not named as well.
+    */
+    for (int k = me + 1; parent < 0 && k < global_modItemCount; ++k) {
+        ModPageItem* block = &global_modItems[k];
+        if (block->itemType != ITEM_LIST
+            || global_modItems[block->parent].itemType != ITEM_LIST
+            || blockIsSkipped(k))
+            continue;
+        block->refused = 1;
+        const BlockName n = blockNameOf(block, file);
+        writeLog("MODPAGE %s: a List%s%s%s is inside another List, which does "
+                 "not draw the rows of a List inside it, so it was skipped",
+                 c->name, n.before, n.name, n.after);
+    }
+
+    /* A ListControl adds to its List the value of the control linked to it,
+       which a page writes as its ListItemValue: [{ ... }], or else its
+       ListItemValue written as text. Where that control was skipped and no
+       ListItemValue is written as text, it adds nothing. */
+    if (item->itemType == ITEM_LIST_CONTROL && !item->refused
+        && item->linked >= 0 && global_modItems[item->linked].refused
+        && !item->listValue[0]) {
+        item->refused = 1;
+        const BlockName n = blockNameOf(item, file);
+        writeLog("MODPAGE %s: a ListControl%s%s%s takes its ListItemValue from "
+                 "a control that was skipped, so it would add nothing to its "
+                 "List and was skipped", c->name, n.before, n.name, n.after);
+    }
+
+    /* The controls linked to a block that was skipped go with it, and so do
+       the controls linked to them: every block after this one was read inside
+       it, after the block it is linked to, so one pass reaches them all. */
+    for (int k = me + 1; k < global_modItemCount; ++k) {
+        ModPageItem* block = &global_modItems[k];
+        if (block->itemType != ITEM_LINKED || block->refused
+            || !global_modItems[block->parent].refused)
+            continue;
+        block->refused = 1;
+        const BlockName n = blockNameOf(block, file);
+        writeLog("MODPAGE %s: a control%s%s%s is linked to a block that was "
+                 "skipped, so it was skipped too", c->name, n.before, n.name,
+                 n.after);
     }
     return me;
 }
@@ -2116,47 +2904,199 @@ static int fatalTagAt(const char* text) {
     return -1;
 }
 
-/* markup says the text reaches the engine as it is written, not with its "<",
-   ">" and "&" turned into entities. */
+static void escapeForMarkup(const char* in, char* out, size_t size);
+
+/* What a line adds after a text it gives with "<", ">" and "&" written as
+   entities. */
+#define AS_ENTITIES " once \"<\", \">\" and \"&\" are written as entities"
+
+/*
+    markup says the text reaches the engine as it is written. A text that is
+    not markup reaches it with its "<", ">" and "&" written as entities, and is
+    checked so written; the line then gives it so written. cut says the text
+    is what the file wrote cut to the room it has, which the line then says.
+*/
 static int textIsSafeToShow(const char* fileName, const char* where,
-                            const char* what, const char* text, int markup) {
-    const int tag = markup ? fatalTagAt(text) : -1;
-    if (tag >= 0) {
+                            const char* what, const char* text, int markup,
+                            int cut = 0) {
+    const size_t room = strlen(text) * 5 + 1;
+    char* escaped = markup ? nullptr : (char*)malloc(room);
+    if (escaped) escapeForMarkup(text, escaped, room);
+    const char* handed = escaped ? escaped : text;
+    const int tag = markup ? fatalTagAt(handed) : -1;
+    const int at = tag >= 0 ? -1 : fatalPipeAt(handed);
+    if (tag >= 0)
         writeLog("MODPAGE %s: the %s of %s holds a \"<\" at byte %d whose \">\" "
                  "is more than %d characters away. The engine measures a tag it "
                  "does not know before putting it back and ends the process "
                  "outright when it is that long, so this page was not loaded",
                  fileName, what, where, tag, LONGEST_TAG_SPAN);
-        writeLog("MODPAGE %s: the text is \"%s\"", fileName, text);
-        return 0;
+    else if (at >= 0)
+        writeLog("MODPAGE %s: the %s of %s holds a \"|\" at byte %d that no "
+                 "second \"|\" closes within 63 characters. The engine copies "
+                 "what follows a \"|\" into a buffer of 64 bytes and ends the "
+                 "process outright when it will not fit, so this page was not "
+                 "loaded", fileName, what, where, at);
+    if (tag >= 0 || at >= 0) {
+        const int entities = escaped && strcmp(escaped, text) != 0;
+        writeLog("MODPAGE %s: the text is \"%s\"%s%s%s", fileName, handed,
+                 cut ? " once cut to the room it has" : "",
+                 cut && entities ? " and" : "", entities ? AS_ENTITIES : "");
     }
-    const int at = fatalPipeAt(text);
-    if (at < 0) return 1;
-    writeLog("MODPAGE %s: the %s of %s holds a \"|\" at byte %d that no second "
-             "\"|\" closes within 63 characters. The engine copies what follows "
-             "a \"|\" into a buffer of 64 bytes and ends the process outright "
-             "when it will not fit, so this page was not loaded", fileName,
-             what, where, at);
-    writeLog("MODPAGE %s: the text is \"%s\"", fileName, text);
-    return 0;
+    free(escaped);
+    return tag < 0 && at < 0;
 }
 
-/* Every string the page will display, checked before the page is kept. */
-static int pageTextIsSafeToShow(const ModPage* page, const char* fileName) {
-    if (!textIsSafeToShow(fileName, "the page", "title", page->title, 1))
+/*
+    The text a control made from item shows under its description while its
+    own dependency does not hold, into out: the dependency description written
+    for it, or where none is written and it has a dependency, a sentence made
+    from the dependency, and *ours is then 1. Empty where it has neither.
+*/
+static void dependencyTextOf(const ModPageItem* item, char* out, size_t room,
+                             int* ours) {
+    *ours = 0;
+    if (item->dependencyDescription[0]) {
+        copyBounded(out, room, item->dependencyDescription,
+                    "dependency description");
+        return;
+    }
+    out[0] = 0;
+    if (!item->dependency[0]) return;
+    /* The condition may hold "<", ">" and "&", which must reach the markup as
+       entities. */
+    char safe[MODPAGE_DEPENDENCY * 5 + 1];
+    char made[sizeof(safe) + 64];
+    escapeForMarkup(item->dependency, safe, sizeof(safe));
+    sprintf_s(made, "To modify this setting, <b>%s</b>.", safe);
+    copyBounded(out, room, made, "dependency description");
+    *ours = 1;
+}
+
+/* Whether a dependency text can be drawn as lockedTextOf hands it to the
+   engine. */
+static int dependencyTextIsSafe(const char* text, int markup);
+
+/* The block that gates block item where it is a List: the block holding it,
+   or the one holding that where that is a ListControl, whatever its ItemType;
+   -1 where it has no holder. The caller checks that it is a List. */
+static int gatingBlockOf(int item) {
+    int gating = global_modItems[item].parent;
+    if (gating >= 0 && global_modItems[gating].itemType == ITEM_LIST_CONTROL)
+        gating = global_modItems[gating].parent;
+    return gating;
+}
+
+static int fatalTagWhenLockedAt(const char* handed, const char* dependency,
+                                int markup);
+
+/*
+    Every string the page will display, checked before the page is kept, as a
+    setting made from the block will hold it: a title or a description written
+    as text cut to the room a setting has for it, and an expression as it is
+    written. A Submenu's or a PageLink's title is never worked out, and cut
+    that way it is what is drawn wherever the title is: the label of the row
+    that opens its page, whether a setting of its own or the text database
+    hands it over (buttonLabelOf), and the heading of the page a Submenu
+    opens (generateOnePage), which pageHead writes as json. What a block
+    inherits is settled later (settleInheritance), and
+    makeSettingsFromModPages checks the descriptions again then; a Submenu
+    or a PageLink whose title is InheritFromParent is checked here, where it
+    draws that title, with the title it will be given, that of the nearest
+    block holding it that does not inherit its title as well, which is in the
+    same file. titleCut says the page's title is what DefineMenuPage wrote
+    cut to the room it has.
+*/
+static int pageTextIsSafeToShow(const ModPage* page, const char* fileName,
+                                int titleCut) {
+    if (!textIsSafeToShow(fileName, "the page", "title", page->title, 1,
+                          titleCut))
         return 0;
     for (int i = page->firstItem; i < page->firstItem + page->itemCount; ++i) {
         const ModPageItem* item = &global_modItems[i];
+        /* For a Submenu or a PageLink, the nearest block whose title it
+           draws; for any other block, the block itself. */
+        const ModPageItem* titled = item;
+        if (item->itemType == ITEM_SUBMENU || item->itemType == ITEM_PAGELINK)
+            while ((titled->inherited & INHERIT_TITLE) && titled->parent >= 0)
+                titled = &global_modItems[titled->parent];
+        /* An inherited title is not drawn, and not checked, on a PageLink
+           whose label the text database holds (PageTextId), or on a block
+           that was skipped or sits inside one. */
+        const int titleDrawn = titled == item
+            || (!(item->itemType == ITEM_PAGELINK && item->pageTextId[0])
+                && !blockIsSkipped(i));
         const char* where = item->settingName[0] ? item->settingName
-                          : item->title[0]       ? item->title
+                          : titled->title[0]     ? titled->title
                                                  : "a block with no name";
         const int markup = item->html != 0;
-        if (!textIsSafeToShow(fileName, where, "title", item->title, 1)
+        const int titledAsText = !textIsExpression(item->title, item->file)
+                              || item->itemType == ITEM_SUBMENU
+                              || item->itemType == ITEM_PAGELINK;
+        const int describedAsText = !textIsExpression(item->description,
+                                                      item->file);
+        char title[MAX_SETTING_TEXT], description[MAX_DESCRIPTION_TEXT];
+        formatInto(title, sizeof(title), "%.*s", (int)sizeof(title) - 1,
+                   titled->title);
+        formatInto(description, sizeof(description), "%.*s",
+                   (int)sizeof(description) - 1, item->description);
+        if ((titleDrawn
+             && !textIsSafeToShow(fileName, where,
+                                  titled != item ? "inherited title" : "title",
+                                  titledAsText ? title : item->title, 1,
+                                  titledAsText
+                                      && strlen(titled->title)
+                                             >= sizeof(title)))
             || !textIsSafeToShow(fileName, where, "description",
-                                 item->description, markup)
+                                 describedAsText ? description
+                                                 : item->description, markup,
+                                 describedAsText
+                                     && strlen(item->description)
+                                            >= sizeof(description))
             || !textIsSafeToShow(fileName, where, "dependency description",
                                  item->dependencyDescription, markup))
             return 0;
+        /*
+            A control's description written as markup is drawn with the text a
+            lock adds after it while the control is locked: the text of its own
+            dependency, or of the dependency of the List it is in.
+        */
+        const int gating = gatingBlockOf(i);
+        const ModPageItem* lockedBy[2] = {
+            item->dependency[0] ? item : nullptr,
+            gating >= 0 && global_modItems[gating].itemType == ITEM_LIST
+                && !global_modItems[gating].refused
+                && global_modItems[gating].dependency[0]
+                ? &global_modItems[gating] : nullptr };
+        const int checked = markup && description[0] && !item->refused
+                         && item->itemType != ITEM_LIST
+                         && item->itemType != ITEM_SUBMENU
+                         && item->itemType != ITEM_PAGELINK && describedAsText;
+        for (const ModPageItem* by : lockedBy) {
+            if (!checked || !by) continue;
+            /* The text cut to the room a setting has for it. */
+            char text[MODPAGE_DEPENDENCY * 5 + 65];
+            int ours = 0;
+            dependencyTextOf(by, text, sizeof(text), &ours);
+            if (strlen(text) >= MAX_DESCRIPTION_TEXT)
+                text[MAX_DESCRIPTION_TEXT - 1] = 0;
+            const int textMarkup = by->html != 0 || ours;
+            if (!dependencyTextIsSafe(text, textMarkup)) continue;
+            const int at = fatalTagWhenLockedAt(description, text, textMarkup);
+            if (at < 0) continue;
+            writeLog("MODPAGE %s: the description of %s holds a \"<\" at byte "
+                     "%d with no \">\" after it. While the control is locked "
+                     "the engine draws the text it is locked with after the "
+                     "description, and the first \">\" there is more than %d "
+                     "characters away. The engine measures a tag it does not "
+                     "know before putting it back and ends the process "
+                     "outright when it is that long, so this page was not "
+                     "loaded", fileName, where, at, LONGEST_TAG_SPAN);
+            writeLog("MODPAGE %s: the text is \"%s\"%s", fileName, description,
+                     strlen(item->description) >= sizeof(description)
+                         ? " once cut to the room it has" : "");
+            return 0;
+        }
         for (int o = 0; o < item->optionCount && o < MAX_MODPAGE_OPTIONS; ++o)
             if (!item->option[o].expression
                 && !textIsSafeToShow(fileName, where, "displayed value",
@@ -2165,31 +3105,57 @@ static int pageTextIsSafeToShow(const ModPage* page, const char* fileName) {
     return 1;
 }
 
-static void readModPageFile(const char* path, const char* fileName) {
+/* Reads the menupage file fileName at path. folder is the folder it is in,
+   as the lines about the file name it: Mod Menus or Game Menus. */
+static void readModPageFile(const char* path, const char* fileName,
+                            const char* folder) {
     if (global_modPageCount >= MAX_MODPAGE_FILES) {
-        writeLog("MODPAGE there is room for %d page(s), so %s was not read",
-                 MAX_MODPAGE_FILES, fileName);
+        writeLog("MODPAGE there is room for %d page(s), so %s in %s was not "
+                 "read", MAX_MODPAGE_FILES, fileName, folder);
+        global_reachUnknown = 1;
         return;
     }
+    /* The page keeps the file's name up to its last '.', and the pages
+       generated for it are named from that. */
+    const char* dot = strrchr(fileName, '.');
+    const size_t nameLength = dot ? (size_t)(dot - fileName) : strlen(fileName);
+    const size_t nameRoom = sizeof(global_modPages[0].name);
+    if (nameLength >= nameRoom) {
+        writeLog("MODPAGE %s in %s: the file's name without its extension is "
+                 "%u character(s) and there is room for %u, so the file was "
+                 "not read", fileName, folder, (unsigned)nameLength,
+                 (unsigned)(nameRoom - 1));
+        global_reachUnknown = 1;
+        return;
+    }
+    char shown[MAX_PATH * 2];
+    formatInto(shown, sizeof(shown), "%s in %s", fileName, folder);
     uint32_t length = 0;
-    char* text = readWholeFile(path, MAX_MODPAGE_BYTES, "MODPAGE", fileName,
+    char* text = readWholeFile(path, MAX_MODPAGE_BYTES, "MODPAGE", shown,
                                &length);
-    if (!text) return;
+    if (!text) {
+        global_reachUnknown = 1;
+        return;
+    }
 
     ModPage* page = &global_modPages[global_modPageCount];
     memset(page, 0, sizeof(*page));
-    strcpy_s(page->name, sizeof(page->name), fileName);
-    char* dot = strrchr(page->name, '.');
-    if (dot) *dot = 0;
+    memcpy(page->name, fileName, nameLength);
+    page->name[nameLength] = 0;
     page->firstItem = global_modItemCount;
 
     ModPageCursor cursor = { text, text + length, page->name, 0 };
+
+    /* Where the page's presets and label expressions begin, so that they can
+       be taken back where the page is refused. */
+    const int firstPreset = global_presetCount;
+    const int firstLabelExpression = global_labelExpressionCount;
 
     /* The Formula keys are read before the blocks: whether a value is an
        expression depends on the names of the formulas. */
     for (;;) {
         skipBlanks(&cursor);
-        if (cursor.at >= cursor.end) break;
+        if (cursor.at >= cursor.end || cursor.tooDeep) break;
         char name[MODPAGE_NAME];
         if (!readKeyName(&cursor, name, sizeof(name))) break;
         skipBlanks(&cursor);
@@ -2200,10 +3166,18 @@ static void readModPageFile(const char* path, const char* fileName) {
         readFormula(&cursor, global_modPageCount, formula);
     }
     cursor.at = text;
+    /* 1 where reading the Formula keys met a block nested too deep, which
+       logged one fault: the page is not kept, and below its Content is
+       stepped over and only the keys at the top of the file are read. A
+       Content stepped over that is not closed is a fault of its own. */
+    const int nestedTooDeep = cursor.tooDeep;
 
+    /* Whether the title DefineMenuPage wrote was cut to fit. */
+    int titleCut = 0;
     for (;;) {
         skipBlanks(&cursor);
-        if (cursor.at >= cursor.end) break;
+        if (cursor.at >= cursor.end || (cursor.tooDeep && !nestedTooDeep))
+            break;
         char name[MODPAGE_NAME];
         if (!readKeyName(&cursor, name, sizeof(name))) {
             modPageFault(&cursor, "a key was expected at the top of the file");
@@ -2211,15 +3185,28 @@ static void readModPageFile(const char* path, const char* fileName) {
         }
         skipBlanks(&cursor);
         if (!_stricmp(name, "Content")) {
-            readBlockList(&cursor, -1, global_modPageCount, global_modPageCount);
+            if (!nestedTooDeep)
+                readBlockList(&cursor, -1, global_modPageCount,
+                              global_modPageCount);
+            else if (!skipBlockList(&cursor))
+                modPageFault(&cursor, cursor.at >= cursor.end
+                                      ? "the file ends inside a block"
+                                      : "a block or a key was expected");
             continue;
         }
         char value[MODPAGE_EXPRESSION * 4];
         readBracketed(&cursor, value, sizeof(value));
         const TextKey* key = textKeyNamed(global_pageTextKey,
                                           KEY_COUNT(global_pageTextKey), name);
-        if (key)
-            copyBounded((char*)page + key->offset, key->room, value, key->what);
+        if (key) {
+            /* A line about a value cut short names the file and its folder,
+               as in "the page title of x.menupage in Mod Menus". */
+            char what[sizeof(shown) + 32];
+            formatInto(what, sizeof(what), "%s of %s", key->what, shown);
+            copyBounded((char*)page + key->offset, key->room, value, what);
+            if (key->offset == offsetof(ModPage, title))
+                titleCut = strlen(value) >= key->room;
+        }
         else if (_stricmp(name, "Formula") != 0)
             writeLog("MODPAGE %s: \"%s\" is not a key the top of a file has",
                      page->name, name);
@@ -2239,8 +3226,20 @@ static void readModPageFile(const char* path, const char* fileName) {
                   page->settingsFile);
     free(text);
 
-    if (!pageTextIsSafeToShow(page, fileName)) {
+    /* Whether the reading may have stopped before the file's
+       ConfigurationFile was read: a fault other than the one nestedTooDeep
+       notes. */
+    const int settingsFileUnknown = !page->settingsFile[0]
+                                 && cursor.faults > nestedTooDeep;
+    if (cursor.tooDeep || !pageTextIsSafeToShow(page, fileName, titleCut)) {
+        if (settingsFileUnknown || global_refusedPageCount >= MAX_MODPAGE_FILES)
+            global_reachUnknown = 1;
+        else
+            strcpy_s(global_refusedPagePath[global_refusedPageCount++],
+                     MAX_PATH, page->storePath);
         global_modItemCount = page->firstItem;
+        global_presetCount = firstPreset;
+        global_labelExpressionCount = firstLabelExpression;
         int kept = 0;
         for (int i = 0; i < global_formulaCount; ++i)
             if (global_formula[i].page != global_modPageCount)
@@ -2249,6 +3248,10 @@ static void readModPageFile(const char* path, const char* fileName) {
         memset(page, 0, sizeof(*page));
         return;
     }
+    if (settingsFileUnknown) global_reachUnknown = 1;
+    page->loadedWhole = !cursor.faults;
+    for (int i = page->firstItem; i < global_modItemCount; ++i)
+        if (global_modItems[i].refused) page->loadedWhole = 0;
     ++global_modPageCount;
 }
 
@@ -2267,10 +3270,16 @@ static void loadMenuPagesFrom(const char* folder, int ofTheGame) {
     do {
         if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
         char path[MAX_PATH];
-        sprintf_s(path, "%s\\%s\\%s", global_directory, folder,
-                  found.cFileName);
+        if (!formatInto(path, sizeof(path), "%s\\%s\\%s", global_directory,
+                        folder, found.cFileName)) {
+            writeLog("MODPAGE %s in %s: its full path is longer than the %d "
+                     "characters Windows allows, so the file was not read",
+                     found.cFileName, folder, MAX_PATH - 1);
+            global_reachUnknown = 1;
+            continue;
+        }
         const int before = global_modPageCount;
-        readModPageFile(path, found.cFileName);
+        readModPageFile(path, found.cFileName, folder);
         if (global_modPageCount > before)
             global_modPages[global_modPageCount - 1].ofTheGame = ofTheGame;
     } while (FindNextFileA(search, &found));
@@ -2306,40 +3315,16 @@ static void loadModPages() {
     A row that opens a page takes its label from the cipherId on the page item,
     which the engine looks up in the text database when the row is built. A
     generated button labelled that way with text of ours is given a cipherId of
-    its own, and the text is put in the cache under the hash of that name when a
-    page is pushed and on every tick after that.
+    its own, and the framework's store of texts answers the hash of that name
+    with the label (textAnswered).
 */
-#define MAX_PAGE_TEXTS 1024
+static int storeText(uint64_t id, const char* text);
 
-struct PageText {
-    uint64_t id;
-    char     text[MODPAGE_TITLE];
-    /* The generated page this label is drawn on, as PushPage names it. Empty
-       means a label that is not on a page of ours and is always written. */
-    char     page[MODPAGE_NAME * 2];
-};
-
-static PageText global_pageText[MAX_PAGE_TEXTS];
-static int      global_pageTextCount = 0;
-
-static void keepPageText(const char* page, const char* cipherId,
-                         const char* text) {
+/* The label: a page's title, or a Submenu's or a PageLink's title cut to the
+   room a setting has for a title. */
+static void keepPageText(const char* cipherId, const char* text) {
     if (!cipherId || !cipherId[0] || !text || !text[0]) return;
-    const uint64_t id = hashText(cipherId);
-    int i = 0;
-    while (i < global_pageTextCount && global_pageText[i].id != id) ++i;
-    if (i == global_pageTextCount) {
-        if (i >= MAX_PAGE_TEXTS) {
-            writeLog("PAGE there is room for %d button label(s), so \"%s\" was "
-                     "left as the widget wrote it", MAX_PAGE_TEXTS, text);
-            return;
-        }
-        global_pageText[global_pageTextCount++].id = id;
-    }
-    copyBounded(global_pageText[i].text, sizeof(global_pageText[i].text), text,
-                "page text");
-    copyBounded(global_pageText[i].page, sizeof(global_pageText[i].page),
-                page ? page : "", "page text page");
+    storeText(hashText(cipherId), text);
 }
 
 #define MAX_PAGE_BYTES     (10u * 1024u * 1024u)
@@ -2376,7 +3361,8 @@ static const char* const global_rowPattern =
     "\"tint.blend\":0.0,\"tint.end\":4294967295,\"tint.start\":4294967295,"
     "\"visible\":1}";
 
-/* A string as json: quotes and backslashes escaped, line breaks kept as \n. */
+/* A string as json: quotes and backslashes escaped, line breaks kept as \n,
+   and the other characters below a space left out. */
 static void writeJsonText(char* out, size_t room, const char* text) {
     size_t at = 0;
     for (const char* p = text; *p && at + 3 < room; ++p) {
@@ -2402,7 +3388,8 @@ static void replaceSpan(char* out, uint32_t* written, uint32_t room, char* from,
 
 /*
     The part of the template before its first row, with the page's own title put
-    in place of the template's. Returns how much was written, or 0.
+    in place of the template's. title holds at most MAX_SETTING_TEXT - 1
+    characters. Returns how much was written, or 0.
 */
 static uint32_t pageHead(const MenuFile* template_, const char* title, char* out,
                          uint32_t room) {
@@ -2468,12 +3455,14 @@ static uint32_t pageHead(const MenuFile* template_, const char* title, char* out
         replaceSpan(out, &written, room, legendAt + 18, legendEnd,
                     "[menu-inspect]MENU_RESET_TO_DEFAULTS,[menu-back]MENU_BACK");
 
-    /* The heading the page draws, which the template gives as plain text. */
+    /* The heading the page draws, which the template gives as plain text.
+       shown has room for every character of title written as json, two
+       bytes each at most, so title is never cut short there. */
     char* titleAt = strstr(out, "\"name\":\"menuTitle1\"");
     char* textAt = titleAt ? strstr(titleAt, "\"text\":\"") : 0;
     char* textEnd = textAt ? strchr(textAt + 8, '"') : 0;
     if (textEnd) {
-        char shown[MODPAGE_TITLE * 2];
+        char shown[MAX_SETTING_TEXT * 2];
         writeJsonText(shown, sizeof(shown), title);
         replaceSpan(out, &written, room, textAt + 8, textEnd, shown);
     }
@@ -2503,8 +3492,8 @@ static void keepGeneratedPage(const char* name, char* text, uint32_t length) {
     entry->attempts = 0;
 }
 
-/* One row put on the end of a page being built. Answers 0 where it does not
-   fit. */
+/* One row put on the end of a page being built, with r rows above it.
+   Answers 0 where it does not fit. */
 static int appendRow(char* text, uint32_t* at, const char* cipherId, int r,
                      const char* rowName, const char* widget, const char* tags,
                      int height = ROW_ITEM_HEIGHT) {
@@ -2543,9 +3532,33 @@ static int settingValueByName(const char* name, int fallback);
 /*
     A data source for one row that opens a page, handing its label over as a
     plain string the way a control's title is. Answers whether one was made; a
-    row without one falls back to its cipherId and the text database.
+    row without one falls back to its cipherId and the text database. onPage
+    names the page the row is on, by its heading or, where it has none, its
+    name; the log names the button by its title and onPage. entryRow says the
+    row is on a page of the game and opens the landing page.
 */
-static int makeButtonSetting(const char* sourceName, const char* title);
+static int makeButtonSetting(const char* sourceName, const char* title,
+                             const char* onPage, int entryRow = 0);
+
+/*
+    The label of the row a Submenu or a PageLink draws, into label: its title
+    cut to the room a setting has for a title, the text pageTextIsSafeToShow
+    checked. Where it was cut, one line says so, naming the button by that
+    text and by onPage, as makeButtonSetting takes it.
+*/
+static void buttonLabelOf(const ModPageItem* item, const char* onPage,
+                          char (&label)[MAX_SETTING_TEXT]) {
+    formatInto(label, sizeof(label), "%.*s", (int)sizeof(label) - 1,
+               item->title);
+    const size_t length = strlen(item->title);
+    if (length >= sizeof(label))
+        writeLog("MENU the button \"%s\" on the page \"%s\" has a title of %u "
+                 "character(s) and there is room for %u, so it was cut short%s",
+                 label, onPage, (unsigned)length, (unsigned)(sizeof(label) - 1),
+                 item->itemType == ITEM_SUBMENU
+                     ? " on the button and as the heading of the page it opens"
+                     : "");
+}
 
 /* Whether a menupage has taken a widget file's name for itself. */
 static int pageIsClaimed(const char* name) {
@@ -2589,11 +3602,17 @@ static int rowsOfPage(int pageIndex, int owner, int* rows, int room) {
     const ModPage* page = &global_modPages[pageIndex];
     const int first = page->firstItem, last = page->firstItem + page->itemCount;
 
+    /* Answers whether block k draws a row. A block that was skipped draws
+       none wherever it stands: at the top of the page, in a list, or linked
+       to another control. A block whose ItemType is missing or not one this
+       format has was skipped when it was read. */
+    auto drawsRow = [](int k) { return !global_modItems[k].refused; };
+
     int block[MAX_MODPAGE_ITEMS], order[MAX_MODPAGE_ITEMS], blocks = 0;
     for (int i = first, rank = 0; i < last && blocks < MAX_MODPAGE_ITEMS; ++i) {
         const ModPageItem* item = &global_modItems[i];
-        if (item->parent != owner || item->refused
-            || item->itemType == ITEM_NONE || item->itemType == ITEM_LINKED)
+        if (item->parent != owner || !drawsRow(i)
+            || item->itemType == ITEM_LINKED)
             continue;
         block[blocks] = i;
         order[blocks++] = rowOrderOf(item, ++rank);
@@ -2614,16 +3633,29 @@ static int rowsOfPage(int pageIndex, int owner, int* rows, int room) {
     int count = 0;
     auto add = [&](int k) {
         rows[count++] = k;
-        if (global_modItems[k].linked >= 0 && count < room)
-            rows[count++] = global_modItems[k].linked;
+        const int linked = global_modItems[k].linked;
+        if (linked >= 0 && drawsRow(linked) && count < room)
+            rows[count++] = linked;
     };
     for (int n = 0; n < blocks && count < room; ++n) {
         const int i = block[n];
         if (global_modItems[i].itemType != ITEM_LIST) { add(i); continue; }
         for (int k = first; k < last && count < room; ++k)
-            if (global_modItems[k].parent == i) add(k);
+            if (global_modItems[k].parent == i && drawsRow(k)) add(k);
     }
     return count;
+}
+
+/*
+    The name of the page a submenu opens: the name of the page the submenu is
+    on, a dash and the submenu's block number, "mods/page-example_mod-12".
+    Answers 0 when that is longer than a widget file's name can be, and out is
+    then empty. The row that opens the page and the page itself are both
+    named through here, so a submenu whose name does not fit has neither.
+*/
+static int submenuPageName(char (&out)[MAX_WIDGET_NAME], const char* onPage,
+                           int block) {
+    return formatInto(out, sizeof(out), "%s-%d", onPage, block);
 }
 
 static void generateOnePage(int pageIndex, int owner, const char* name,
@@ -2633,10 +3665,15 @@ static void generateOnePage(int pageIndex, int owner, const char* name,
 
     uint32_t at = pageHead(template_, title, text, MAX_PAGE_BYTES);
     if (!at) { free(text); return; }
+    /* What the log calls this page: its heading, or its name where it has
+       none. */
+    const char* onPage = title[0] ? title : name;
 
     int rows[MAX_MODPAGE_ITEMS];
     const int count = rowsOfPage(pageIndex, owner, rows, MAX_MODPAGE_ITEMS);
 
+    /* How many rows have been written, which is where the next one goes. */
+    int written = 0;
     for (int r = 0; r < count; ++r) {
         const ModPageItem* item = &global_modItems[rows[r]];
         /* Room for the longest tag list a row can carry: a page link's action
@@ -2647,18 +3684,33 @@ static void generateOnePage(int pageIndex, int owner, const char* name,
         char cipherId[MODPAGE_NAME + 24] = "";
         char buttonSource[MODPAGE_NAME + 24];
         sprintf_s(buttonSource, "modmenu-button-%d", rows[r]);
+        char label[MAX_SETTING_TEXT] = "";
 
         if (item->itemType == ITEM_SUBMENU) {
+            char target[MAX_WIDGET_NAME];
+            if (!submenuPageName(target, name, rows[r])) {
+                writeLog("PAGE %s: the submenu %s would open a page named "
+                         "%s-%d, which is longer than the %d characters a "
+                         "widget file's name can have, so the submenu's row "
+                         "and its page were left out",
+                         global_modPages[pageIndex].name,
+                         item->title[0] ? item->title : "with no title", name,
+                         rows[r], MAX_WIDGET_NAME - 1);
+                /* A control linked to the submenu draws its row directly
+                   under the submenu's, and is left out with it. */
+                if (item->linked >= 0 && r + 1 < count
+                    && rows[r + 1] == item->linked)
+                    ++r;
+                continue;
+            }
             sprintf_s(rowName, "submenu%d", rows[r]);
-            /* As large as tags, so a name too long fails where tags is written. */
-            char target[sizeof(tags)];
-            sprintf_s(target, "%s-%d", name, rows[r]);
-            const int labelled = makeButtonSetting(buttonSource, item->title);
+            buttonLabelOf(item, onPage, label);
+            const int labelled = makeButtonSetting(buttonSource, label, onPage);
             openingTags(tags, sizeof(tags), "push-fullscreen", target,
                         labelled ? buttonSource : 0);
             if (!labelled) {
                 sprintf_s(cipherId, "MODMENU_SUBMENU_%d", rows[r]);
-                keepPageText(name, cipherId, item->title);
+                keepPageText(cipherId, label);
             }
         } else if (item->itemType == ITEM_PAGELINK) {
             /* The row the game draws for one of its own pages: the same button,
@@ -2671,28 +3723,39 @@ static void generateOnePage(int pageIndex, int owner, const char* name,
                game's, which decides whether the row is shown at all, and
                PageTextId names one of the game's labels; either of those wins,
                and the label then comes from the text database as the game's own
-               rows do. Without either the title is written as given. */
+               rows do. Without either the title is written as given, cut as
+               buttonLabelOf cuts it. */
             sprintf_s(rowName, "pagelink%d", rows[r]);
             if (item->pageTextId[0])
                 copyBounded(cipherId, sizeof(cipherId), item->pageTextId,
                             "page text id");
+            else buttonLabelOf(item, onPage, label);
+            const int entryRow = global_modPages[pageIndex].ofTheGame
+                && _stricmp(item->pageName, LANDING_PAGE_NAME) == 0;
             const char* source =
                 item->pageDataSource[0] ? item->pageDataSource
-                : !cipherId[0] && makeButtonSetting(buttonSource, item->title)
+                : !cipherId[0]
+                  && makeButtonSetting(buttonSource, label, onPage, entryRow)
                 ? buttonSource : 0;
             openingTags(tags, sizeof(tags),
                         item->openOverlay ? "push" : "push-fullscreen",
                         item->pageName, source);
             if (!cipherId[0] && !strstr(tags, buttonSource)) {
                 sprintf_s(cipherId, "MODMENU_PAGELINK_%d", rows[r]);
-                keepPageText(name, cipherId, item->title);
+                keepPageText(cipherId, label);
             }
         } else {
-            widget = global_rowWidget[item->controlType < 0 ? MODPAGE_TOGGLE
-                                                            : item->controlType];
             /* A keybind's row is a button whose choosing sends KEYBIND_EVENT,
-               on which the framework takes the next key held. */
-            if (item->controlType == MODPAGE_KEYBIND)
+               on which the framework takes the next key held. Where keys
+               cannot be set in this build it is a selector's row, which
+               shows the key's name as its one option. */
+            const int keyRow = item->controlType == MODPAGE_KEYBIND
+                            && keybindsCanBeSet();
+            const int drawnAs = item->controlType < 0 ? MODPAGE_TOGGLE
+                              : item->controlType == MODPAGE_KEYBIND && !keyRow
+                              ? MODPAGE_SELECTOR : item->controlType;
+            widget = global_rowWidget[drawnAs];
+            if (keyRow)
                 sprintf_s(tags, "\"action\":\"send-event %s\","
                                 "\"allowTtsOnFocus\":\"true\","
                                 "\"dataSource\":\"%s\"", KEYBIND_EVENT,
@@ -2704,9 +3767,12 @@ static void generateOnePage(int pageIndex, int owner, const char* name,
         const int height = item->itemType != ITEM_SUBMENU
                            && item->itemType != ITEM_PAGELINK
                            && item->controlType == MODPAGE_KEYBIND
+                           && keybindsCanBeSet()
                          ? KEYBIND_ROW_HEIGHT : ROW_ITEM_HEIGHT;
-        if (!appendRow(text, &at, cipherId, r, rowName, widget, tags, height))
+        if (!appendRow(text, &at, cipherId, written, rowName, widget, tags,
+                       height))
             break;
+        ++written;
     }
     if (at + 4 >= MAX_PAGE_BYTES) {
         free(text);
@@ -2715,13 +3781,19 @@ static void generateOnePage(int pageIndex, int owner, const char* name,
     }
     closePage(name, text, at);
 
-    /* A submenu becomes a page of its own, drawn the same way. */
+    /* A submenu becomes a page of its own, drawn the same way, headed with
+       its title as the row that opens it is labelled: cut to the room a
+       setting has for a title, the text pageTextIsSafeToShow checked, which
+       pageHead does not cut again. A submenu whose page name does not fit
+       was left out of the rows above and gets no page. */
     for (int r = 0; r < count; ++r) {
         if (global_modItems[rows[r]].itemType != ITEM_SUBMENU) continue;
-        char childName[MODPAGE_NAME + 8];
-        sprintf_s(childName, "%s-%d", name, rows[r]);
-        generateOnePage(pageIndex, rows[r], childName,
-                        global_modItems[rows[r]].title, template_);
+        char childName[MAX_WIDGET_NAME];
+        if (!submenuPageName(childName, name, rows[r])) continue;
+        char heading[MAX_SETTING_TEXT];
+        formatInto(heading, sizeof(heading), "%.*s", (int)sizeof(heading) - 1,
+                   global_modItems[rows[r]].title);
+        generateOnePage(pageIndex, rows[r], childName, heading, template_);
     }
 }
 
@@ -2729,12 +3801,13 @@ static void generateOnePage(int pageIndex, int owner, const char* name,
 static void generateLandingPage(const MenuFile* template_) {
     char* text = (char*)malloc(MAX_PAGE_BYTES);
     if (!text) return;
-    uint32_t at = pageHead(template_, "MOD CONFIGURATION", text, MAX_PAGE_BYTES);
+    const char* const heading = "MOD CONFIGURATION";
+    uint32_t at = pageHead(template_, heading, text, MAX_PAGE_BYTES);
     if (!at) { free(text); return; }
 
     /* The row on the options list that opens this page, whose cipherId the
        substituted menu/page-options-v3 carries. */
-    keepPageText("", "MODMENU_ROOT", "MOD CONFIGURATION");
+    keepPageText("MODMENU_ROOT", heading);
 
     for (int p = 0; p < global_modPageCount; ++p) {
         const ModPage* page = &global_modPages[p];
@@ -2745,12 +3818,13 @@ static void generateLandingPage(const MenuFile* template_) {
         sprintf_s(buttonSource, "modmenu-mod-%d", p);
         sprintf_s(rowName, "mod%d", p);
         sprintf_s(target, "mods/page-%s", page->name);
-        const int labelled = makeButtonSetting(buttonSource, page->title);
+        const int labelled = makeButtonSetting(buttonSource, page->title,
+                                               heading);
         openingTags(tags, sizeof(tags), "push-fullscreen", target,
                     labelled ? buttonSource : 0);
         if (!labelled) {
             sprintf_s(cipherId, "MODMENU_PAGE_%d", p);
-            keepPageText(LANDING_PAGE_NAME, cipherId, page->title);
+            keepPageText(cipherId, page->title);
         }
         if (!appendRow(text, &at, cipherId, p, rowName, BUTTON_WIDGET, tags))
             break;
@@ -3043,20 +4117,44 @@ static const char global_keybindCellDocument[] =
     "/list-items/item-button-remap-default-text-pc.widget\",\"tint.blend\":0.0"
     ",\"tint.end\":4294967295,\"tint.start\":4294967295,\"visible\":1}]}";
 
+static int keybindRemapWidgetsUnderPc();
+
 /* One of the keybind row's widget files, put in the table with the pages. */
 static void keepKeybindFile(const char* name, const char* document,
                             size_t length) {
-    char* text = (char*)malloc(length + 1);
+    static const char from[] = "\"source\":\"menu/list-items/item-button-remap-";
+    static const char to[] = "\"source\":\"pc/menu/list-items/item-button-remap-";
+    const int underPc = keybindRemapWidgetsUnderPc();
+    size_t moved = 0;
+    if (underPc)
+        for (const char* at = strstr(document, from); at; at = strstr(at + 1, from))
+            ++moved;
+    const size_t room = length + moved * (sizeof(to) - sizeof(from)) + 1;
+    char* text = (char*)malloc(room);
     if (!text) {
         writeLog("PAGE no memory for %s, so no keybind row can be drawn", name);
         return;
     }
-    memcpy(text, document, length + 1);
-    keepGeneratedPage(name, text, (uint32_t)length);
+    size_t used = 0;
+    const char* rest = document;
+    for (const char* at = underPc ? strstr(rest, from) : nullptr; at;
+         at = strstr(rest, from)) {
+        memcpy(text + used, rest, (size_t)(at - rest));
+        used += (size_t)(at - rest);
+        memcpy(text + used, to, sizeof(to) - 1);
+        used += sizeof(to) - 1;
+        rest = at + sizeof(from) - 1;
+    }
+    const size_t tail = length - (size_t)(rest - document);
+    memcpy(text + used, rest, tail + 1);
+    used += tail;
+    keepGeneratedPage(name, text, (uint32_t)used);
 }
 
-/* The keybind row's widget files, when a menupage has a keybind. */
+/* The keybind row's widget files, when a menupage has a keybind and keys can
+   be set from its row in this build. */
 static void generateKeybindRow() {
+    if (!keybindsCanBeSet()) return;
     int any = 0;
     for (int i = 0; i < global_modItemCount && !any; ++i)
         any = !global_modItems[i].refused
@@ -3070,6 +4168,8 @@ static void generateKeybindRow() {
                     sizeof(global_keybindCellDocument) - 1);
 }
 
+static void noteSettingsOnNoPage();
+
 static void generateMenuPages() {
     if (!global_modPageCount) return;
     generateKeybindRow();
@@ -3077,6 +4177,7 @@ static void generateMenuPages() {
     if (!fallback || !fallback->text) {
         writeLog("PAGE %s is not in %s, so no page can be generated",
                  PAGE_TEMPLATE_NAME, TEMPLATE_FOLDER);
+        noteSettingsOnNoPage();
         return;
     }
     for (int p = 0; p < global_modPageCount; ++p) {
@@ -3098,6 +4199,7 @@ static void generateMenuPages() {
         generateOnePage(p, -1, name, page->title, built);
     }
     generateLandingPage(fallback);
+    noteSettingsOnNoPage();
 }
 
 /* ------------------------------------------------------- registering a name */
@@ -3235,19 +4337,7 @@ static void widgetFileRegistrarHook(void* registers, void*) {
 
 #define MAX_FRAMEWORK_SOURCES 512
 
-/*
-    How many slots each class's own table holds, up to where the next table
-    begins. The tables in this region begin at 02E83ED8, 02E83FF0 and
-    02E840E8, the addresses their constructors load. Build specific.
-
-    Words copied past these are the next class's methods and are replaced.
-*/
-#define SLIDER_VTABLE_SLOTS    35
-#define SELECTOR_VTABLE_SLOTS  31
-
 #define MAX_SOURCE_TEXT        64
-
-#define MAX_SETTING_TEXT      128
 
 /*
     The class each kind of row is built from. Every method that reads the
@@ -3256,8 +4346,6 @@ static void widgetFileRegistrarHook(void* registers, void*) {
 */
 #define SELECTOR_CLASS "Menu2::DataSourceSelector"
 #define SLIDER_CLASS   "Menu2::DataSourceSlider"
-
-#define MAX_DESCRIPTION_TEXT  1024
 
 /* How many named options a selector may offer. */
 #define MAX_OPTIONS            12
@@ -3275,7 +4363,9 @@ static void widgetFileRegistrarHook(void* registers, void*) {
 #define KIND_BUTTON             4
 #define KIND_PRESET             5   /* a selector of presets; keeps no value */
 #define KIND_KEYBIND            6   /* a key, kept as its virtual-key code in
-                                       hexadecimal; its row is a button */
+                                       hexadecimal; its row is a button, or
+                                       where keys cannot be set a selector
+                                       (keyShownOnly) */
 
 /*
     A setting of ours. The engine's own CreateDataSource builds it as an object
@@ -3336,6 +4426,10 @@ struct OurSetting {
     int      hadNoRow;
     int      touched;
     int      locked;                   /* the last LOCKED_BY_ answer given */
+    /* That answer was not applied to a key of its settings file, as the
+       write was put off while Init ran (writeIsPutOff). settleLocks and
+       GetAvailability apply it again. */
+    int      lockPutOff;
     float    least;
     float    greatest;
     float    step;
@@ -3343,7 +4437,7 @@ struct OurSetting {
     int      logarithmic;              /* steps on the logarithmic scale */
     float    smallestStep;             /* its finest step there, 0 for none */
     int      optionCapacity;           /* the most options it can offer */
-    int      hidden;                   /* the last answer slot 20 gave */
+    int      hidden;                   /* the last answer the hidden slot gave */
     /* Its limits, its option count or its value moved while being worked out
        again, and its row has not been drawn again since. */
     int      rangeMoved;
@@ -3355,6 +4449,14 @@ struct OurSetting {
        hidden bit, and draws a hidden row as disabled, so a row that is shown
        must be drawn once more. */
     int      shownAgain;
+    /* A button: the row on a page of the game that opens the landing page;
+       and the page it is on, by its heading or, where it has none, its
+       name, by which and its title the log names it. */
+    int      entryRow;
+    char     onPage[MAX_SETTING_TEXT];
+    /* No widget file of ours names it as a data source, so no page draws its
+       row and no data source is made for it (noteSettingsOnNoPage). */
+    int      onNoPage;
     int      kind;
     int      index;                    /* which option a row sits on */
     /* A preset: the store writes its shown option was worked out at, and the
@@ -3377,7 +4479,6 @@ struct OurSetting {
     float    asFloat;
     uint64_t titleKeyId;
     uint64_t descriptionKeyId;
-    uint64_t dependencyDescriptionKeyId;
     uint64_t id;
     uint64_t classId;
     uint64_t object;
@@ -3390,12 +4491,25 @@ static int           global_ourSourceCount = 0;
 /*
     The engine keeps its data sources in a slot pool of a fixed size, and a
     source made when the pool is full ends the process. The game fills the pool
-    nearly to the top by itself.
+    nearly to the top by itself: in Part I it takes 531 of the 541 nodes, and
+    the build's safeFrameworkSources (6) of ours fit in the rest with a few to
+    spare; in Part II it takes 752 of the 809 once the player menu has opened,
+    and none of ours is made unless the pool is enlarged.
 
-    maxFrameworkSources is how many to make. Past it, a setting is left
-    without a source: its row shows the text its widget was authored with.
+    maxFrameworkSources is how many to make, read from the settings file.
+    Before the first is made, enlargeDataSourcePool lowers it, where it asks
+    for more, to what the pool has room for: the safe number where the pool
+    is left as the engine made it, the nodes added and the safe number where
+    it is enlarged, and none where the pool may be half changed. Past it, a
+    setting is left without a source: its row shows the text its widget was
+    authored with.
 */
-static int           global_maxFrameworkSources = 6;
+static int           global_maxFrameworkSources = 0;
+
+/* Whether maxFrameworkSources was lowered to what the pool has room for. The
+   log then already says how many settings of ours that leaves out, where it
+   leaves any out. */
+static int           global_poolLimitedSettings = 0;
 
 static void giveOurSettingsOwnVtable();
 static volatile LONG global_settingsMade = 0;
@@ -3405,6 +4519,46 @@ static volatile LONG global_settingsMade = 0;
 static int holdsValue(const OurSetting* s) {
     return s->kind != KIND_LIST && s->kind != KIND_BUTTON
         && s->kind != KIND_PRESET;
+}
+
+/*
+    Whether s is a keybind whose key cannot be set in this build
+    (keybindsCanBeSet). Its row is a selector of one option, the key's name;
+    the framework never writes its key, whether its row is used, its page is
+    reset, a preset names it or it locks and unlocks; a reset never counts
+    it as one to put back.
+*/
+static int keyShownOnly(const OurSetting* s) {
+    return s && s->kind == KIND_KEYBIND && !keybindsCanBeSet();
+}
+
+/*
+    Every setting of ours that no widget file of ours names in a dataSource
+    tag is marked as on no page. A generated page that was not kept names
+    none, and the page of a submenu whose page name does not fit is not
+    generated.
+*/
+static void noteSettingsOnNoPage() {
+    static const char tag[] = "\"dataSource\":\"";
+    for (int i = 0; i < global_ourSourceCount; ++i)
+        global_ourSources[i].onNoPage = 1;
+    for (int f = 0; f < global_menuFileCount; ++f) {
+        const char* text = global_menuFiles[f].text;
+        for (const char* at = text ? strstr(text, tag) : nullptr; at;
+             at = strstr(at, tag)) {
+            at += sizeof(tag) - 1;
+            const char* end = strchr(at, '"');
+            if (!end) break;
+            const size_t length = (size_t)(end - at);
+            for (int i = 0; i < global_ourSourceCount; ++i) {
+                OurSetting* s = &global_ourSources[i];
+                if (strlen(s->name) == length
+                    && memcmp(s->name, at, length) == 0)
+                    s->onNoPage = 0;
+            }
+            at = end;
+        }
+    }
 }
 
 /* ------------------------------------------------------------- the store */
@@ -3441,13 +4595,81 @@ static void storedText(const char* path, const char* section, const char* key,
    settings match only after something may have changed. */
 static volatile LONG global_storeWrites = 0;
 
-static void keepText(const char* path, const char* section, const char* key,
-                     const char* value) {
-    if (!path || !path[0] || !key || !key[0]) return;
+/* Where Mod_Settings_Cache.ini is, empty where there is no folder for it. */
+static char global_settingsCachePath[MAX_PATH];
+
+/*
+    The files a write to failed, each kept as hashText of its path with how
+    many lines were written about it, so that each file has up to
+    WRITE_LINES_PER_FILE of them. Past MAX_FAILING_FILES files, one line says
+    that no more are written.
+*/
+#define MAX_FAILING_FILES     32
+#define WRITE_LINES_PER_FILE  16
+
+static uint64_t      global_failingFile[MAX_FAILING_FILES];
+static volatile LONG global_failingFileLines[MAX_FAILING_FILES];
+static volatile LONG global_failingFileCount = 0;
+static volatile LONG global_failingFilesFull = 0;
+
+/* 1 while Init runs installHooks. */
+static int global_starting = 0;
+
+/* 1 where Windows answers no attributes for path, as for a file that does
+   not exist, or where the file there holds 0 bytes. */
+static int fileIsMissingOrEmpty(const char* path) {
+    WIN32_FILE_ATTRIBUTE_DATA about;
+    if (!GetFileAttributesExA(path, GetFileExInfoStandard, &about)) return 1;
+    return !(about.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        && !about.nFileSizeLow && !about.nFileSizeHigh;
+}
+
+/* Whether a write to the file at path is put off: while Init runs
+   installHooks, a settings file that is missing or empty
+   (fileIsMissingOrEmpty) is not written. A write to Mod_Settings_Cache.ini
+   never is. */
+static int writeIsPutOff(const char* path) {
+    return global_starting && path && path[0]
+        && _stricmp(path, global_settingsCachePath) != 0
+        && fileIsMissingOrEmpty(path);
+}
+
+static void forgetPutAsideOfNewFiles(int keepMissing = 0);
+
+/* value written under key, or the key taken out where value is nullptr.
+   Answers 0 where the file could not be written, or where the write is put
+   off (writeIsPutOff), which writes nothing and no line; and 1 otherwise,
+   including where there is no file or no key to write to. Once Init is over,
+   the settings files noted as new are looked at before anything is written
+   (forgetPutAsideOfNewFiles). */
+static int keepText(const char* path, const char* section, const char* key,
+                    const char* value) {
+    if (!path || !path[0] || !key || !key[0]) return 1;
+    if (!global_starting) forgetPutAsideOfNewFiles();
     InterlockedIncrement(&global_storeWrites);
-    if (!WritePrivateProfileStringA(storeSectionOf(section), key, value, path))
-        writeLog("STORE %s could not be written to %s, error %lu", key, path,
-                 GetLastError());
+    if (writeIsPutOff(path)) return 0;
+    if (WritePrivateProfileStringA(storeSectionOf(section), key, value, path))
+        return 1;
+    const DWORD error = GetLastError();
+    const uint64_t file = hashText(path);
+    LONG at = 0;
+    const LONG count = global_failingFileCount;
+    while (at < count && global_failingFile[at] != file) ++at;
+    if (at == count && count < MAX_FAILING_FILES) {
+        global_failingFile[at] = file;
+        global_failingFileLines[at] = 0;
+        InterlockedIncrement(&global_failingFileCount);
+    }
+    if (at < MAX_FAILING_FILES) {
+        if (InterlockedIncrement(&global_failingFileLines[at])
+            <= WRITE_LINES_PER_FILE)
+            writeLog("STORE %s could not be written to %s, error %lu", key,
+                     path, error);
+        else InterlockedDecrement(&global_failingFileLines[at]);
+    } else if (InterlockedExchange(&global_failingFilesFull, 1) == 0)
+        writeLog("STORE %d files could not be written, so a failure to write "
+                 "any other file is not logged", MAX_FAILING_FILES);
+    return 0;
 }
 
 /* A number as short as it can be written, so 3 is "3" and 2.5 is "2.5". */
@@ -3656,7 +4878,8 @@ static OurSetting* settingNamed(const char* path, const char* section,
 /*
     A name written section.key, held in whole, split at its first dot, or at
     its last where last is set. A name without a dot is read in the section of
-    the control that asks, where there is one. Answers the key.
+    the control that asks, where there is one. Answers the key. A section cut
+    short is logged as a capped line (copyBounded's capped).
 */
 static const char* splitSettingName(char* whole, int last,
                                     const OurSetting* owner, char* section,
@@ -3665,10 +4888,10 @@ static const char* splitSettingName(char* whole, int last,
     section[0] = 0;
     if (dot) {
         *dot = 0;
-        copyBounded(section, room, whole, what);
+        copyBounded(section, room, whole, what, 1);
         return dot + 1;
     }
-    if (owner) copyBounded(section, room, owner->storeSection, what);
+    if (owner) copyBounded(section, room, owner->storeSection, what, 1);
     return whole;
 }
 
@@ -3965,17 +5188,44 @@ static void takeValue(OurSetting* s, const char* held, int complain) {
 /*
     Mod_Settings_Cache.ini, beside this plugin's own settings file. One section
     per mod, named after the settings file the mod keeps its values in, and two
-    keys per control:
+    keys for each setting a control can reach:
 
-        <section>.<setting>.default   the value written while it is locked
-        <section>.<setting>.stored    the value it held when it locked
+        <section>.<setting>.stored    the value put aside while it is locked
+        <section>.<setting>.default   the default written to the settings
+                                      file in its place
 
-    Both keys exist only while the control is locked. A control that is still
-    locked when the game is closed finds them again on the next run.
+    When a control locks, what the settings file holds, or the default where
+    it holds nothing, is written to .stored, unless the value already there
+    belongs to the lock (readPutAside says when it does); then the default is
+    written to the settings file and to .default, each where it does not hold
+    it already. Where either cannot be written, the settings file is left
+    holding what it held and the control keeps its value while locked. A
+    preset chosen while a control that put a value aside is locked writes its
+    value to .stored where the value there belongs to the lock or the control
+    has a default, and the default as a lock does where the value there did
+    not belong to the lock or the settings file does not hold the default, as
+    when it could not be written when the control locked; where the default
+    cannot be written to the settings file then, the unlock takes what the
+    settings file holds, not the preset's value. A reset writes the
+    default to .stored. When the control unlocks, the value in .stored is
+    written back to the settings file where it belongs to the lock, and both
+    keys are taken out. They stay after an unlock that could not write the
+    value back, and a control that is still locked when the game is closed
+    finds them again on the next run. While Init runs installHooks, a lock,
+    or an unlock that would write a value back, whose settings file is
+    missing or empty (writeIsPutOff), leaves both files as they are and the
+    control as it is; the lock state is applied again once Init is over, the
+    first time the control is asked whether it is available or the locks are
+    settled after a change. A preset keeps the values it puts aside in the
+    same section, under <preset>.custom.<setting>, with <preset>.custom set to
+    1 once it has.
+
+    The keys ending in .stored and .default of a settings file that was
+    missing or empty when the framework started are taken out once the mod
+    has written it (forgetPutAsideOfNewFiles), and those no control reaches
+    are taken out at start (forgetUnreachedPutAside).
 */
 #define SETTINGS_CACHE_NAME "Mod_Settings_Cache.ini"
-
-static char global_settingsCachePath[MAX_PATH];
 
 static void buildSettingsCachePath() {
     const char* slash = strrchr(global_iniPath, '\\');
@@ -3994,12 +5244,17 @@ struct CacheNames {
     char storedKey[MAX_SOURCE_TEXT * 2 + 16];
 };
 
-static void cacheNames(const OurSetting* s, const char* key, CacheNames* out) {
-    const char* slash = strrchr(s->storePath, '\\');
-    copyBounded(out->section, sizeof(out->section),
-                slash ? slash + 1 : s->storePath, "cache section");
-    char* dot = strrchr(out->section, '.');
+/* The cache section of the controls whose settings file is at storePath: the
+   file's name without its extension, empty for no settings file. */
+static void cacheSectionOf(const char* storePath, char* out, size_t room) {
+    const char* slash = strrchr(storePath, '\\');
+    copyBounded(out, room, slash ? slash + 1 : storePath, "cache section");
+    char* dot = strrchr(out, '.');
     if (dot) *dot = 0;
+}
+
+static void cacheNames(const OurSetting* s, const char* key, CacheNames* out) {
+    cacheSectionOf(s->storePath, out->section, sizeof(out->section));
     sprintf_s(out->defaultKey, "%s.%s.default", s->storeSection, key);
     sprintf_s(out->storedKey, "%s.%s.stored", s->storeSection, key);
 }
@@ -4012,9 +5267,25 @@ static void cacheNames(const OurSetting* s, const char* key, CacheNames* out) {
     different key as the controls that expression reads change, and only one of
     them at a time. Each selector the expression reads is stepped through its
     own values, and for every one of them the name and the default are worked
-    out together. The selectors are put back as they were.
+    out together. The stepping is held for this thread alone
+    (global_steppedControl), and the selectors are not changed.
 
     The key the control is reading now is always the first answered.
+
+    Where an expression cannot be worked out here, no line says so. A key or
+    a default worked out longer than the room for it is cut short as
+    refreshExpressions cuts it, with cutToRoom's one line for each control
+    and text.
+
+    everyOption 1 also answers the key the name gives now, steps a toggle as
+    well as a selector, answers each option's key whether or not the
+    settings file holds it, and answers a key whose default cannot be worked
+    out, with an empty default. complete, where given, receives 1 where the
+    keys answered are every key the name can give: the name is written
+    outright, or it was worked out, read one selector (or toggle, with
+    everyOption) and nothing else for each of that control's options, read
+    no key of a settings file that no control holds, and every key fitted in
+    room; and 0 otherwise.
 
     Answers how many were filled in, which is 1 for a control whose name is
     written outright.
@@ -4032,88 +5303,599 @@ static int evaluateExpression(const char* text, const OurSetting* owner,
                               const OurSetting** read = nullptr,
                               int* readCount = nullptr, int readRoom = 0);
 
+/* expression, a setting key's where isKey is 1 and a default's where it is
+   0, worked out for s into out, which has room bytes, with no line where it
+   cannot be worked out, and cut to fit as refreshExpressions cuts it. read,
+   readCount and readRoom are as evaluateExpression takes them. Answers
+   whether it was worked out. */
+static int workOutQuietly(const OurSetting* s, const char* expression,
+                          int isKey, char* out, size_t room,
+                          const OurSetting** read = nullptr,
+                          int* readCount = nullptr, int readRoom = 0);
+
 struct KeyAndDefault {
     char key[MAX_SOURCE_TEXT];
     char fallback[MAX_SETTING_TEXT];
 };
 
-static int everyKeyOf(OurSetting* s, KeyAndDefault* out, int room) {
-    if (room < 1) return 0;
-    copyBounded(out[0].key, sizeof(out[0].key), s->storeKey, "a key");
-    copyBounded(out[0].fallback, sizeof(out[0].fallback), s->fallbackText,
-                "a default");
-    int count = out[0].key[0] ? 1 : 0;
+/* Counts every name an expression has read from a settings file, as no
+   control of that name holds it. */
+static volatile LONG global_namesReadFromStore = 0;
 
+/* For each thread, the selector or toggle everyKeyOf is stepping through its
+   options, null for none, and the option it stands at, counted from 0: an
+   expression worked out on that thread reads that option's value for it
+   (valueOfName) in place of the one the control holds. */
+static thread_local const OurSetting* global_steppedControl = nullptr;
+static thread_local int               global_steppedOption = 0;
+
+static int everyKeyOf(OurSetting* s, KeyAndDefault* out, int room,
+                      int everyOption = 0, int* complete = nullptr) {
+    if (complete) *complete = 0;
+    if (room < 1) return 0;
+    strcpy_s(out[0].key, sizeof(out[0].key), s->storeKey);
+    strcpy_s(out[0].fallback, sizeof(out[0].fallback), s->fallbackText);
+    int count = out[0].key[0] ? 1 : 0;
+    if (!s->keyExpression[0]) {
+        if (complete) *complete = 1;
+        return count;
+    }
+
+    const LONG storeReads = global_namesReadFromStore;
     const OurSetting* read[EXPRESSION_READS];
     int readCount = 0;
-    char key[MAX_SETTING_TEXT];
-    if (!s->keyExpression[0]
-        || !evaluateExpression(s->keyExpression, s, key, sizeof(key), read,
-                               &readCount, EXPRESSION_READS))
+    char key[sizeof(out[0].key)];
+    if (!workOutQuietly(s, s->keyExpression, 1, key, sizeof(key), read,
+                        &readCount, EXPRESSION_READS))
         return count;
+    int whole = readCount <= 1;
+    if (everyOption && key[0] && (!count || _stricmp(out[0].key, key) != 0)) {
+        if (count < room) {
+            strcpy_s(out[count].key, sizeof(out[count].key), key);
+            out[count].fallback[0] = 0;
+            ++count;
+        } else whole = 0;
+    }
 
     for (int r = 0; r < readCount && count < room; ++r) {
-        OurSetting* chooser = (OurSetting*)read[r];
+        const OurSetting* chooser = read[r];
         /* A selector whose count is an expression is stepped through every
            option it can offer. An option past the count in use reaches a key
            only where the settings file already holds that key. */
         const int wasCount = chooser->optionCount;
         const int reach = chooser->optionCapacity > wasCount
                         ? chooser->optionCapacity : wasCount;
-        if (chooser == s || chooser->kind != KIND_SELECTOR || reach < 2)
+        const int stepped = chooser->kind == KIND_SELECTOR
+                         || (everyOption && chooser->kind == KIND_TOGGLE);
+        if (chooser == s || !stepped || reach < 2) {
+            whole = 0;
             continue;
+        }
 
-        const int wasIndex = chooser->index;
-        const float wasValue = chooser->value;
-        chooser->optionCount = reach;
-        for (int o = 0; o < reach && count < room; ++o) {
-            chooser->index = o;
-            chooser->value = (float)o;
-            if (!evaluateExpression(s->keyExpression, s, key, sizeof(key))
+        global_steppedControl = chooser;
+        for (int o = 0; o < reach; ++o) {
+            global_steppedOption = o;
+            const OurSetting* readNow[EXPRESSION_READS];
+            int readNowCount = 0;
+            if (!workOutQuietly(s, s->keyExpression, 1, key, sizeof(key),
+                                readNow, &readNowCount, EXPRESSION_READS)
                 || !key[0]) continue;
+            if (readNowCount != 1 || readNow[0] != chooser) whole = 0;
 
             int already = 0;
             for (int k = 0; k < count && !already; ++k)
                 already = _stricmp(out[k].key, key) == 0;
             if (already) continue;
-            if (o >= wasCount) {
+            if (o >= wasCount && !everyOption) {
                 char held[MAX_SETTING_TEXT];
                 storedText(s->storePath, s->storeSection, key, "", held,
                            sizeof(held));
                 if (!held[0]) continue;
             }
 
-            char fallback[MAX_SETTING_TEXT];
+            char fallback[sizeof(out[0].fallback)];
             if (s->defaultExpression[0]) {
-                if (!evaluateExpression(s->defaultExpression, s, fallback,
-                                        sizeof(fallback)))
-                    continue;
-            } else copyBounded(fallback, sizeof(fallback), s->fallbackText,
-                               "a default");
-            if (!fallback[0]) continue;
+                if (!workOutQuietly(s, s->defaultExpression, 0, fallback,
+                                    sizeof(fallback))) {
+                    if (!everyOption) continue;
+                    fallback[0] = 0;
+                }
+            } else strcpy_s(fallback, sizeof(fallback), s->fallbackText);
+            if (!fallback[0] && !everyOption) continue;
 
-            copyBounded(out[count].key, sizeof(out[count].key), key, "a key");
-            copyBounded(out[count].fallback, sizeof(out[count].fallback),
-                        fallback, "a default");
+            if (count >= room) {
+                whole = 0;
+                break;
+            }
+            strcpy_s(out[count].key, sizeof(out[count].key), key);
+            strcpy_s(out[count].fallback, sizeof(out[count].fallback),
+                     fallback);
             ++count;
         }
-        chooser->optionCount = wasCount;
-        chooser->index = wasIndex;
-        chooser->value = wasValue;
+        global_steppedControl = nullptr;
     }
+    if (complete)
+        *complete = whole && global_namesReadFromStore == storeReads;
     return count;
 }
 
 /*
+    The values put aside that an unlock could not take out of
+    Mod_Settings_Cache.ini during this run, each kept as hashText of its cache
+    section and key written as "[section]key". A value left behind belongs to
+    the lock again only where the store holds that same value, and otherwise
+    the control's value is put aside afresh when it locks again. Past
+    MAX_LEFT_BEHIND of them, and for a value left behind in an earlier run,
+    only what the store holds decides.
+*/
+#define MAX_LEFT_BEHIND 1024
+
+static uint64_t global_leftBehind[MAX_LEFT_BEHIND];
+static int      global_leftBehindCount = 0;
+
+/* Answers where id stands among the values left behind, or -1. */
+static int leftBehindAt(uint64_t id) {
+    for (int i = 0; i < global_leftBehindCount; ++i)
+        if (global_leftBehind[i] == id) return i;
+    return -1;
+}
+
+/* id noted as left behind where left is 1, and taken off the note where left
+   is 0. */
+static void noteLeftBehind(uint64_t id, int left) {
+    const int at = leftBehindAt(id);
+    if (left && at < 0 && global_leftBehindCount < MAX_LEFT_BEHIND)
+        global_leftBehind[global_leftBehindCount++] = id;
+    else if (!left && at >= 0)
+        global_leftBehind[at] = global_leftBehind[--global_leftBehindCount];
+}
+
+/* ----------------------------------------- values put aside, forgotten */
+
+/*
+    A set of keys of Mod_Settings_Cache.ini on the heap: room of them, count
+    filled, each kept as hashText of the key folded to lower case. Sorted
+    (sortKeySet) before it is searched (keySetHolds).
+*/
+struct CacheKeySet {
+    uint64_t* id;
+    int       count;
+    int       room;
+};
+
+/* An empty set with room for the two cache keys of every setting key each
+   control can reach. Its id is null where there is no memory for it. */
+static CacheKeySet newKeySet() {
+    CacheKeySet set = {};
+    set.room = 2 * MAX_KEYS_OF_ONE
+             * (global_ourSourceCount > 0 ? global_ourSourceCount : 1);
+    set.id = (uint64_t*)malloc(sizeof(uint64_t) * (size_t)set.room);
+    return set;
+}
+
+static int compareKeyIds(const void* a, const void* b) {
+    const uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+static void sortKeySet(CacheKeySet* set) {
+    if (set->id && set->count > 1)
+        qsort(set->id, (size_t)set->count, sizeof(uint64_t), compareKeyIds);
+}
+
+static int keySetHolds(const CacheKeySet* set, const char* key) {
+    if (!set->id || !set->count) return 0;
+    const uint64_t id = hashText(key, 1);
+    return bsearch(&id, set->id, (size_t)set->count, sizeof(uint64_t),
+                   compareKeyIds) != nullptr;
+}
+
+/*
+    The cache keys, .stored and .default, of every setting key s can reach
+    (everyKeyOf with everyOption), added to set. Answers 1 where those are
+    every key s can reach (everyKeyOf's complete) and all fitted in set.
+*/
+static int addReachedKeys(OurSetting* s, CacheKeySet* set) {
+    KeyAndDefault reach[MAX_KEYS_OF_ONE];
+    int complete = 0;
+    const int count = everyKeyOf(s, reach, MAX_KEYS_OF_ONE, 1, &complete);
+    for (int k = 0; k < count; ++k) {
+        if (!set->id || set->count + 2 > set->room) return 0;
+        CacheNames names;
+        cacheNames(s, reach[k].key, &names);
+        set->id[set->count++] = hashText(names.storedKey, 1);
+        set->id[set->count++] = hashText(names.defaultKey, 1);
+    }
+    return complete;
+}
+
+/* The section of Mod_Settings_Cache.ini the controls whose settings file is
+   at storePath use, as keepText names it (storeSectionOf), hashed ignoring
+   case. */
+static uint64_t cacheSectionId(const char* storePath) {
+    char section[MAX_PATH];
+    cacheSectionOf(storePath, section, sizeof(section));
+    return hashText(storeSectionOf(section), 1);
+}
+
+/* Whether key, in the cache section section (cacheSectionId), is a value put
+   aside or a default noted beside one: it ends in .stored or .default, and
+   is not a key a preset of that section keeps its own values under
+   (<preset>.custom, and <preset>.custom.<setting>). */
+static int isPutAsideKey(const char* key, uint64_t section) {
+    const size_t length = strlen(key);
+    if (!(length >= 7 && !_stricmp(key + length - 7, ".stored"))
+        && !(length >= 8 && !_stricmp(key + length - 8, ".default")))
+        return 0;
+    for (int i = 0; i < global_ourSourceCount; ++i) {
+        const OurSetting* s = &global_ourSources[i];
+        if (s->kind != KIND_PRESET || cacheSectionId(s->storePath) != section)
+            continue;
+        char custom[MAX_SOURCE_TEXT + 8];
+        formatInto(custom, sizeof(custom), "%s.custom", s->name);
+        const size_t n = strlen(custom);
+        if (n && !_strnicmp(key, custom, n) && (!key[n] || key[n] == '.'))
+            return 0;
+    }
+    return 1;
+}
+
+#define MAX_CACHE_SECTION_BYTES (10u * 1024u * 1024u)
+
+/*
+    Takes out of Mod_Settings_Cache.ini, in the cache section of the controls
+    whose settings file is at storePath, every key isPutAsideKey answers for
+    that only holds, where only is given, and keep does not hold, where keep
+    is given. The section is written once, with the lines that stay, or
+    taken out whole where no line stays; a line with no '=' stays. One line
+    says so where the section cannot be read whole or cannot be written.
+*/
+static void takeOutPutAside(const char* storePath, const CacheKeySet* only,
+                            const CacheKeySet* keep) {
+    if (!global_settingsCachePath[0]) return;
+    char named[MAX_PATH];
+    cacheSectionOf(storePath, named, sizeof(named));
+    const char* section = storeSectionOf(named);
+    const uint64_t sectionId = hashText(section, 1);
+
+    /* Every line of the section, key=value for a key, each ended by a zero
+       and the last by two, in lines, which has held bytes. */
+    char* lines = nullptr;
+    DWORD held = 0, length = 0;
+    for (DWORD room = 64 * 1024;; room *= 2) {
+        char* larger = (char*)realloc(lines, room);
+        if (!larger) break;
+        lines = larger;
+        held = room;
+        length = GetPrivateProfileSectionA(section, lines, held,
+                                           global_settingsCachePath);
+        if (length + 2 < held || held >= MAX_CACHE_SECTION_BYTES) break;
+    }
+    if (!lines || length + 2 >= held) {
+        writeLog("STORE the [%s] section of %s could not be read whole, so the "
+                 "values put aside there were left as they are", section,
+                 SETTINGS_CACHE_NAME);
+        free(lines);
+        return;
+    }
+
+    /* The lines that stay moved up over those that go, in place. */
+    int going = 0, staying = 0;
+    char* kept = lines;
+    for (char* line = lines; *line;) {
+        const size_t size = strlen(line) + 1;
+        char* equals = strchr(line, '=');
+        int goes = 0;
+        if (equals) {
+            *equals = 0;
+            goes = isPutAsideKey(line, sectionId)
+                && (!only || keySetHolds(only, line))
+                && !(keep && keySetHolds(keep, line));
+            *equals = '=';
+        }
+        if (goes) ++going;
+        else {
+            ++staying;
+            memmove(kept, line, size);
+            kept += size;
+        }
+        line += size;
+    }
+    *kept = 0;
+
+    if (going) {
+        InterlockedIncrement(&global_storeWrites);
+        const BOOL written = staying
+            ? WritePrivateProfileSectionA(section, lines,
+                                          global_settingsCachePath)
+            : WritePrivateProfileStringA(section, nullptr, nullptr,
+                                         global_settingsCachePath);
+        if (!written)
+            writeLog("STORE the values put aside in the [%s] section of %s "
+                     "could not be taken out, error %lu", section,
+                     SETTINGS_CACHE_NAME, GetLastError());
+    }
+    free(lines);
+}
+
+/*
+    The values put aside for the controls whose settings file is at path
+    forgotten, as for a file just written with its defaults: every key of its
+    cache section that isPutAsideKey answers for. Where another settings file
+    may share that section (another page's settings file of the same name, a
+    page of that section that was not loaded, or global_reachUnknown), only
+    the keys the controls of path reach and no other control reaches.
+*/
+static void forgetPutAsideOf(const char* path) {
+    const uint64_t section = cacheSectionId(path);
+    int shared = global_reachUnknown;
+    for (int p = 0; p < global_modPageCount && !shared; ++p)
+        shared = _stricmp(global_modPages[p].storePath, path) != 0
+              && cacheSectionId(global_modPages[p].storePath) == section;
+    for (int r = 0; r < global_refusedPageCount && !shared; ++r)
+        shared = cacheSectionId(global_refusedPagePath[r]) == section;
+    if (!shared) {
+        takeOutPutAside(path, nullptr, nullptr);
+        return;
+    }
+    CacheKeySet mine = newKeySet(), others = newKeySet();
+    if (mine.id && others.id) {
+        for (int i = 0; i < global_ourSourceCount; ++i) {
+            OurSetting* s = &global_ourSources[i];
+            if (s->modItem < 0 || cacheSectionId(s->storePath) != section)
+                continue;
+            addReachedKeys(s, _stricmp(s->storePath, path) == 0 ? &mine
+                                                               : &others);
+        }
+        sortKeySet(&mine);
+        sortKeySet(&others);
+        takeOutPutAside(path, &mine, &others);
+    } else
+        writeLog("STORE there was no memory to forget the values put aside "
+                 "for %s", path);
+    free(mine.id);
+    free(others.id);
+}
+
+/*
+    The settings files that were missing or empty when the framework started:
+    its own, looked at before writeDefaultSettings writes it, and every other
+    one a page names, looked at once the pages are read. A file stays noted
+    until forgetPutAsideOfNewFiles takes it off.
+*/
+#define MAX_NEW_SETTINGS_FILES (MAX_MODPAGE_FILES + 1)
+
+static char global_newSettingsFile[MAX_NEW_SETTINGS_FILES][MAX_PATH];
+static int  global_newSettingsFileCount = 0;
+
+/* path noted, where it is missing or empty now and is not noted already. */
+static void noteNewSettingsFile(const char* path) {
+    if (!path || !path[0]) return;
+    for (int i = 0; i < global_newSettingsFileCount; ++i)
+        if (_stricmp(global_newSettingsFile[i], path) == 0) return;
+    if (global_newSettingsFileCount < MAX_NEW_SETTINGS_FILES
+        && fileIsMissingOrEmpty(path))
+        strcpy_s(global_newSettingsFile[global_newSettingsFileCount++],
+                 MAX_PATH, path);
+}
+
+/*
+    Each settings file noteNewSettingsFile noted, looked at again. One that is
+    no longer missing or empty has been written by its mod: the values put
+    aside for it are forgotten (forgetPutAsideOf), and it is no longer noted.
+    One still missing or empty stays noted where keepMissing is 1, and
+    otherwise is no longer noted, with its values put aside kept. While Init
+    runs installHooks only the framework's own file is looked at. Called with
+    keepMissing 0 as Init ends (makeSettingsFromModPages), before any value
+    put aside is read (readPutAside, resetOpenPage) and, once Init is over,
+    before the framework writes any file (keepText); and with keepMissing 1
+    from the tick (forgetPutAsideOfWrittenFiles). The tick's thread and the
+    thread of the menu's callbacks may call it at the same time:
+    global_forgetLock is held throughout, nothing it calls may call it again,
+    and nothing it calls may change a control, or global_quietExpressions on
+    another thread (everyKeyOf, workOutQuietly).
+*/
+static SRWLOCK global_forgetLock = SRWLOCK_INIT;
+
+static void forgetPutAsideOfNewFiles(int keepMissing) {
+    AcquireSRWLockExclusive(&global_forgetLock);
+    for (int i = 0; i < global_newSettingsFileCount;) {
+        if (global_starting
+            && _stricmp(global_newSettingsFile[i], global_iniPath) != 0) {
+            ++i;
+            continue;
+        }
+        const int missing = fileIsMissingOrEmpty(global_newSettingsFile[i]);
+        if (missing && keepMissing) {
+            ++i;
+            continue;
+        }
+        char path[MAX_PATH];
+        strcpy_s(path, global_newSettingsFile[i]);
+        if (i != --global_newSettingsFileCount)
+            strcpy_s(global_newSettingsFile[i], MAX_PATH,
+                     global_newSettingsFile[global_newSettingsFileCount]);
+        if (!missing) forgetPutAsideOf(path);
+    }
+    ReleaseSRWLockExclusive(&global_forgetLock);
+}
+
+/* When the tick last looked at the settings files noted as new, as
+   GetTickCount64 gives it; 0 before it first has. */
+static ULONGLONG global_newFilesLookedAt = 0;
+
+/*
+    Every tick: once Init is over and while a settings file is noted as new,
+    at most once a second, the values put aside for each noted file that is
+    no longer missing or empty are forgotten, and the files still missing or
+    empty stay noted (forgetPutAsideOfNewFiles with keepMissing 1).
+*/
+static void forgetPutAsideOfWrittenFiles(void) {
+    if (global_starting || !global_newSettingsFileCount) return;
+    const ULONGLONG now = GetTickCount64();
+    if (global_newFilesLookedAt && now - global_newFilesLookedAt < 1000)
+        return;
+    global_newFilesLookedAt = now;
+    forgetPutAsideOfNewFiles(1);
+}
+
+/*
+    Takes out of Mod_Settings_Cache.ini the values put aside, and the
+    defaults noted beside them, that no control reaches: for the cache
+    section of each settings file a loaded page names, every key
+    isPutAsideKey answers for that no control of that section reaches
+    (addReachedKeys). A section is left as it is where one of its pages,
+    those that name no settings file included, was not loaded, or was loaded
+    with a fault or a skipped block; where the keys of one of its controls
+    are not all known; or where its controls reach no key. Every section is
+    left as it is while global_reachUnknown is set.
+*/
+static void forgetUnreachedPutAside() {
+    if (global_reachUnknown || !global_settingsCachePath[0]) return;
+    CacheKeySet reached = newKeySet();
+    if (!reached.id) {
+        writeLog("STORE there was no memory to find the values put aside that "
+                 "no control reaches");
+        return;
+    }
+    for (int p = 0; p < global_modPageCount; ++p) {
+        if (!global_modPages[p].storePath[0]) continue;
+        const uint64_t section = cacheSectionId(global_modPages[p].storePath);
+        int done = 0, whole = 1;
+        for (int q = 0; q < global_modPageCount; ++q) {
+            if (cacheSectionId(global_modPages[q].storePath) != section)
+                continue;
+            if (q < p && global_modPages[q].storePath[0]) done = 1;
+            if (!global_modPages[q].loadedWhole) whole = 0;
+        }
+        for (int r = 0; r < global_refusedPageCount; ++r)
+            if (cacheSectionId(global_refusedPagePath[r]) == section) whole = 0;
+        if (done || !whole) continue;
+        reached.count = 0;
+        for (int i = 0; i < global_ourSourceCount && whole; ++i) {
+            OurSetting* s = &global_ourSources[i];
+            if (s->modItem >= 0 && cacheSectionId(s->storePath) == section)
+                whole = addReachedKeys(s, &reached);
+        }
+        if (!whole || !reached.count) continue;
+        sortKeySet(&reached);
+        takeOutPutAside(global_modPages[p].storePath, nullptr, &reached);
+    }
+    free(reached.id);
+}
+
+/*
     What a control holds while its dependency does not, and what it goes back
-    to when the dependency holds again. Answers whether anything was written.
+    to when the dependency holds again. Answers whether the value the control
+    holds was changed.
 */
 static void composeList(int owner);
+static int presetValuesMatch(const char* held, const char* wanted);
+
+/* The list whose value s's value is composed into, as its place in
+   global_ourSources: the list s belongs to, or the list of the list item that
+   carries s as its linked control. -1 for none. */
+static int listOf(const OurSetting* s) {
+    if (s->listOwner >= 0) return s->listOwner;
+    const int self = (int)(s - global_ourSources);
+    for (int i = 0; i < global_ourSourceCount; ++i)
+        if (global_ourSources[i].linkedSetting == self)
+            return global_ourSources[i].listOwner;
+    return -1;
+}
+
+/*
+    What Mod_Settings_Cache.ini and the settings file hold for the setting key
+    a control reaches, as readPutAside reads them.
+
+        names    the cache section and the keys the value is kept under
+        entry    hashText of "[section]<stored key>", as global_leftBehind
+                 keeps it
+        stored   the value put aside, empty where there is none
+        noted    the default noted beside it, empty where there is none
+        held     what the settings file holds, empty where it holds nothing
+        belongs  the value put aside belongs to the lock
+
+    A value put aside belongs to the lock where the settings file holds that
+    same value, or where it has not been left behind and the settings file
+    holds nothing, the default noted beside it or the control's default. Two
+    numbers are the same value however they are written. Anything else in the
+    settings file was written there after the value was put aside, as happens
+    once an unlock could not take that value out of the cache, and it is the
+    settings file's value that counts.
+*/
+struct PutAside {
+    CacheNames names;
+    uint64_t   entry;
+    char       stored[MAX_SETTING_TEXT];
+    char       noted[MAX_SETTING_TEXT];
+    char       held[MAX_SETTING_TEXT];
+    int        belongs;
+};
+
+/* fallback is the default of the setting key of s. The settings files noted
+   as new are looked at first (forgetPutAsideOfNewFiles). */
+static void readPutAside(const OurSetting* s, const char* key,
+                         const char* fallback, PutAside* out) {
+    forgetPutAsideOfNewFiles();
+    cacheNames(s, key, &out->names);
+    storedText(global_settingsCachePath, out->names.section,
+               out->names.storedKey, "", out->stored, sizeof(out->stored));
+    char entryName[sizeof(out->names.section) + sizeof(out->names.storedKey)
+                   + 2];
+    formatInto(entryName, sizeof(entryName), "[%s]%s", out->names.section,
+               out->names.storedKey);
+    out->entry = hashText(entryName);
+    storedText(s->storePath, s->storeSection, key, "", out->held,
+               sizeof(out->held));
+    storedText(global_settingsCachePath, out->names.section,
+               out->names.defaultKey, "", out->noted, sizeof(out->noted));
+    out->belongs = out->stored[0]
+                && (presetValuesMatch(out->held, out->stored)
+                    || (leftBehindAt(out->entry) < 0
+                        && (!out->held[0]
+                            || presetValuesMatch(out->held, out->noted)
+                            || presetValuesMatch(out->held, fallback))));
+}
+
+/*
+    The default of the setting key of s, fallback, written to its settings
+    file where the file does not hold it already, and noted beside the value
+    put aside where it is not noted already, as a lock leaves them. Where it
+    cannot be noted the settings file is put back to what it held: a settings
+    file holding a default that is not noted no longer belongs to the lock
+    once the default changes again. Answers whether both were done.
+*/
+static int writeLockedDefault(const OurSetting* s, const char* key,
+                              const char* fallback, const PutAside* aside) {
+    const int rewrite = _stricmp(aside->held, fallback) != 0;
+    /* Whether the settings file holds the key, an empty value included, or
+       could not be read; putting the file back takes out only a key it did
+       not hold. */
+    const int hadKey = rewrite
+        && (aside->held[0]
+            || settingIsPresent(s->storePath, storeSectionOf(s->storeSection),
+                                key) != 0);
+    if (rewrite && !keepText(s->storePath, s->storeSection, key, fallback))
+        return 0;
+    if (_stricmp(aside->noted, fallback) != 0
+        && !keepText(global_settingsCachePath, aside->names.section,
+                     aside->names.defaultKey, fallback)) {
+        if (rewrite)
+            keepText(s->storePath, s->storeSection, key,
+                     hadKey ? aside->held : nullptr);
+        return 0;
+    }
+    return 1;
+}
 
 static volatile LONG global_emptyDefaultLines = 0;
+static volatile LONG global_putAsideLines = 0;
+static volatile LONG global_giveBackLines = 0;
 
 static int applyLockState(OurSetting* s, int why) {
-    if (!global_settingsCachePath[0] || !holdsValue(s)) return 0;
+    if (!global_settingsCachePath[0] || !holdsValue(s) || keyShownOnly(s))
+        return 0;
 
     /*
         Every key the control can address, not only the one it is reading. A
@@ -4122,61 +5904,104 @@ static int applyLockState(OurSetting* s, int why) {
     */
     KeyAndDefault reach[MAX_KEYS_OF_ONE];
     const int count = everyKeyOf(s, reach, MAX_KEYS_OF_ONE);
-    int did = 0;
+    int did = 0, putOff = 0;
 
     for (int k = 0; k < count; ++k) {
         const int onScreen = _stricmp(reach[k].key, s->storeKey) == 0;
-        CacheNames names;
-        cacheNames(s, reach[k].key, &names);
-        char stored[MAX_SETTING_TEXT];
-        storedText(global_settingsCachePath, names.section, names.storedKey, "",
-                   stored, sizeof(stored));
+        const char* fallback = reach[k].fallback;
+        PutAside aside;
+        readPutAside(s, reach[k].key, fallback, &aside);
+        const CacheNames& names = aside.names;
+        const char* const stored = aside.stored;
+        const char* const held = aside.held;
+        const int belongs = aside.belongs;
+
+        /*
+            An empty default is never written. A control whose DefaultValue is
+            an expression has none until the expression has been worked out.
+        */
+        if (why != LOCKED_BY_NOTHING && !fallback[0]) {
+            if (InterlockedIncrement(&global_emptyDefaultLines) <= 16)
+                writeLog("STORE \"%s\" is locked and has no default to write, "
+                         "so what it holds was left alone", s->name);
+            continue;
+        }
+        if (why == LOCKED_BY_NOTHING && !stored[0]) continue;
+        /*
+            Where the settings file would be written and the write is put off
+            (writeIsPutOff), as at a lock or a value given back, nothing is
+            put aside, written, noted or taken for this key: the cache keeps
+            what it holds, the control what it holds, and lockPutOff has the
+            lock state applied again once Init is over.
+        */
+        if (writeIsPutOff(s->storePath)
+            && (why != LOCKED_BY_NOTHING
+                || (belongs && _stricmp(held, stored) != 0))) {
+            putOff = 1;
+            continue;
+        }
+        const float was = s->value;
 
         if (why != LOCKED_BY_NOTHING) {
             /*
-                An empty default is never written. A control whose DefaultValue
-                is an expression has none until the expression has been worked
-                out.
+                Where nothing put aside belongs to the lock, what the store
+                holds is put aside. The default is then written to the store
+                and noted beside the value put aside, as writeLockedDefault
+                does, on this lock and on every lock after it. Where the value
+                could not be put aside, or the store could not be written, the
+                store is left as it is and the control keeps its value while
+                locked.
             */
-            if (!reach[k].fallback[0]) {
-                if (InterlockedIncrement(&global_emptyDefaultLines) <= 16)
-                    writeLog("STORE \"%s\" is locked and has no default to "
-                             "write, so what it holds was left alone", s->name);
+            if (!belongs
+                && !keepText(global_settingsCachePath, names.section,
+                             names.storedKey, held[0] ? held : fallback)) {
+                if (InterlockedIncrement(&global_putAsideLines) == 1)
+                    writeLog("STORE \"%s\" is locked but what it holds could "
+                             "not be put aside in %s, so its default was not "
+                             "written and it keeps that value while locked, as "
+                             "does any control that locks while the file "
+                             "cannot be written", s->name, SETTINGS_CACHE_NAME);
                 continue;
             }
-
-            /* The value is put aside the first time only. After that the
-               default is written again whether or not anything has
-               changed it. */
-            if (!stored[0]) {
-                char held[MAX_SETTING_TEXT];
-                storedText(s->storePath, s->storeSection, reach[k].key,
-                           reach[k].fallback, held, sizeof(held));
-                if (!held[0])
-                    copyBounded(held, sizeof(held), reach[k].fallback, "value");
-                keepText(global_settingsCachePath, names.section,
-                         names.storedKey, held);
-                keepText(global_settingsCachePath, names.section,
-                         names.defaultKey, reach[k].fallback);
-                did = 1;
+            noteLeftBehind(aside.entry, 0);
+            if (!writeLockedDefault(s, reach[k].key, fallback, &aside))
+                continue;
+            if (onScreen) takeValue(s, fallback, 0);
+        } else {
+            /*
+                The value put aside is given back where the store holds a
+                different one, and taken out of the cache; one that does not
+                belong to the lock is only taken out, and the control takes
+                what the store holds. One that cannot be given back stays in
+                the cache for a later unlock or a later run, and one that
+                cannot be taken out is left behind.
+            */
+            if (belongs && _stricmp(held, stored) != 0
+                && !keepText(s->storePath, s->storeSection, reach[k].key,
+                             stored)) {
+                if (InterlockedIncrement(&global_giveBackLines) == 1)
+                    writeLog("STORE \"%s\" is unlocked but the value it held "
+                             "before it locked could not be written back to "
+                             "its settings file, so that value stays in %s "
+                             "and is written back on a later unlock or a "
+                             "later run, as is any other value in that case",
+                             s->name, SETTINGS_CACHE_NAME);
+                continue;
             }
-            if (onScreen) takeValue(s, reach[k].fallback, 0);
-            keepText(s->storePath, s->storeSection, reach[k].key,
-                     reach[k].fallback);
-            continue;
+            if (belongs && onScreen) takeValue(s, stored, 0);
+            else if (!belongs && onScreen && held[0]) takeValue(s, held, 0);
+            const int takenOut = keepText(global_settingsCachePath,
+                                          names.section, names.storedKey,
+                                          nullptr);
+            noteLeftBehind(aside.entry, !takenOut);
+            keepText(global_settingsCachePath, names.section, names.defaultKey,
+                     nullptr);
         }
-
-        if (!stored[0]) continue;
-        if (onScreen) takeValue(s, stored, 0);
-        keepText(s->storePath, s->storeSection, reach[k].key, stored);
-        keepText(global_settingsCachePath, names.section, names.storedKey,
-                 nullptr);
-        keepText(global_settingsCachePath, names.section, names.defaultKey,
-                 nullptr);
-        did = 1;
+        if (!sameNumber(was, s->value)) did = 1;
     }
 
-    if (did && s->listOwner >= 0) composeList(s->listOwner);
+    s->lockPutOff = putOff;
+    if (did) composeList(listOf(s));
     return did;
 }
 
@@ -4221,7 +6046,7 @@ static void settleLocks() {
             OurSetting* s = &global_ourSources[i];
             if (!holdsValue(s)) continue;
             const int why = whyLocked(s);
-            if (why == s->locked) continue;
+            if (why == s->locked && !s->lockPutOff) continue;
             takeLockState(s, why);
             moved = 1;
         }
@@ -4254,73 +6079,132 @@ static void applyEveryLockState() {
 
     Menu2::IDataSource::PopulateComponentFromItem puts the answer to the
     availability slot onto the component, and the engine reaches it only
-    through Gui2::Widget::RefreshFromDataSource at 0254E6D0, which a component
-    reaches through its own slot +0x358. The engine does not call it on a built
-    row by itself, so a lock that changes is drawn only by calling it here.
+    through Gui2::Widget::RefreshFromDataSource (Part I 0254E6D0), which a
+    component reaches through its own slot widgetRefreshSource. The engine
+    does not call it on a built row by itself, so a lock that changes is drawn
+    only by calling it here.
 
     The widget handed to GetItemData is not always the row itself. The row is
     the first component at or above it whose data source is the one asked
-    about.
-
-        02661C00   AsComponent(widget), by the class id bit at [widget+0x50]
-        01EF8BCC   the parent widget
-        +0x350     the component's data source
-        +0x358     refresh from the data source
+    about (the build's asComponent, parentWidget and widgetGetDataSource).
 
     Every widget is a process in the engine's relocatable heap, so a row is
     held as the engine holds a process, by its heap record and its id:
 
-        widget + ROW_RECORD      the widget's heap record
-        widget + ROW_ID          the widget's id, 32 bits
-        widget + ROW_STATE       bit ROW_DEAD set once it has been killed
+        widget + rowRecord       the widget's heap record
+        widget + rowId           the widget's id, 32 bits
+        widget + rowState        bit ROW_DEAD set once it has been killed
         record + RECORD_OBJECT   where the widget is now, 0 once it is freed
         record + 0x28            its parent's record
 
     The record names the row only while the widget there carries the id; a
     freed record is given to the next widget made. Each place is read out of
-    the three functions below, which must stand byte for byte at their
-    addresses before any row is held.
+    the build's parentWidget, handleResolve and firstChildWidget. These three
+    and asComponent must stand byte for byte at their addresses before any row
+    is held or asComponent or parentWidget is called.
 */
-#define AS_COMPONENT_RVA        0x02661C00ull
-#define PARENT_WIDGET_RVA       0x01EF8BCCull
-#define HANDLE_RESOLVE_RVA      0x011B3F10ull
-#define FIRST_CHILD_WIDGET_RVA  0x02549FC0ull
-#define WIDGET_GET_DATA_SOURCE  0x350
-#define WIDGET_REFRESH_SOURCE   0x358
-
-#define ROW_RECORD     0x70
-#define ROW_ID         0x98
-#define ROW_STATE      0x10
 #define ROW_DEAD       0x01
 #define RECORD_OBJECT  0x08
 
-/* The parent widget:  record = [widget + ROW_RECORD], parent = [record +
-   0x28], answer [parent + RECORD_OBJECT]. */
-static const uint8_t parentWidgetBytes[] = {
+/*
+    tlou-i.exe 1.1.5.0: rowRecord 0x70, rowId 0x98, rowState 0x10.
+
+    The parent widget (01EF8BCC): record = [widget + rowRecord], parent =
+    [record + 0x28], answer [parent + RECORD_OBJECT].
+*/
+static const uint8_t partOneParentWidgetBytes[] = {
     0x48,0x8B,0x49,0x70, 0x33,0xC0, 0x48,0x85,0xC9, 0x74,0x0D,
     0x48,0x8B,0x49,0x28, 0x48,0x85,0xC9, 0x74,0x04,
     0x48,0x8B,0x41,0x08, 0xC3
 };
 
-/* The handle resolve: the widget at [record + RECORD_OBJECT], answered only
-   where its ROW_ID matches the id the handle holds. */
-static const uint8_t handleResolveBytes[] = {
+/* The handle resolve (011B3F10): the widget at [record + RECORD_OBJECT],
+   answered only where its rowId matches the id the handle holds. */
+static const uint8_t partOneHandleResolveBytes[] = {
     0x8B,0x51,0x08, 0x85,0xD2, 0x0F,0x84,0x1F,0x20,0x22,0xFF,
     0x49,0x8B,0x48,0x08, 0x48,0x85,0xC9, 0x0F,0x84,0x12,0x20,0x22,0xFF,
     0x39,0x91,0x98,0x00,0x00,0x00, 0x48,0x0F,0x44,0xC1, 0xC3
 };
 
-/* The first child widget, which passes over a child whose ROW_STATE has
-   ROW_DEAD set. */
-static const uint8_t firstChildWidgetBytes[] = {
+/* The first child widget (02549FC0), which passes over a child whose
+   rowState has ROW_DEAD set. */
+static const uint8_t partOneFirstChildWidgetBytes[] = {
     0x48,0x83,0xEC,0x28, 0xE8,0x03,0xE9,0x9A,0xFF, 0xEB,0x10,
     0x48,0x85,0xC0, 0x74,0x06, 0xF6,0x41,0x10,0x01, 0x74,0x12,
     0xE8,0x5D,0xEB,0x9A,0xFF, 0x48,0x8B,0xC8, 0xE8,0x11,0xF0,0xFF,0xFF,
     0x48,0x85,0xC9, 0x75,0xE3, 0x48,0x83,0xC4,0x28, 0xC3
 };
 
-/* 1 once the three functions above stood at their addresses. Rows are held
-   only then. */
+/* The component check (02661C00), the whole function. */
+static const uint8_t partOneAsComponentBytes[] = {
+    0x33,0xC0, 0x48,0x85,0xC9, 0x74,0x25, 0x44,0x8B,0x0D,0x6A,0xE7,0x02,0x01,
+    0x48,0x8B,0x51,0x50, 0x45,0x8B,0xC1, 0x49,0xC1,0xE9,0x06,
+    0x41,0x83,0xE0,0x3F, 0xC4,0x22,0xBB,0xF7,0x44,0xCA,0x28,
+    0x41,0xF6,0xC0,0x01, 0x48,0x0F,0x45,0xC1, 0xC3
+};
+
+/*
+    tlou-ii.exe and tlou-ii-l.exe 1.6.0: rowRecord 0x80, rowId 0x94, rowState
+    0x0C.
+
+    The parent widget (tlou-ii.exe 01340BF0, tlou-ii-l.exe 013549E0), the same
+    bytes in both.
+*/
+static const uint8_t partTwoParentWidgetBytes[] = {
+    0x48,0x8B,0x81,0x80,0x00,0x00,0x00, 0x48,0x85,0xC0, 0x74,0x0E,
+    0x48,0x8B,0x40,0x28, 0x48,0x85,0xC0, 0x74,0x05,
+    0x48,0x8B,0x40,0x08, 0xC3, 0x33,0xC0, 0xC3
+};
+
+/* A handle resolve, one of the game's identical copies (tlou-ii.exe
+   003383E0, tlou-ii-l.exe 002A7D40), the same bytes in both. */
+static const uint8_t partTwoHandleResolveBytes[] = {
+    0x48,0x8B,0x11, 0x33,0xC0, 0x48,0x85,0xD2, 0x74,0x1D,
+    0x44,0x8B,0x41,0x08, 0x45,0x85,0xC0, 0x74,0x14,
+    0x48,0x8B,0x4A,0x08, 0x48,0x85,0xC9, 0x74,0x0B,
+    0x44,0x39,0x81,0x94,0x00,0x00,0x00, 0x48,0x0F,0x44,0xC1, 0xC3
+};
+
+/* The first child widget, up to its test of the child's rowState and the
+   jump that follows it: tlou-ii.exe 01E544E0, then tlou-ii-l.exe 01E7D200. */
+static const uint8_t partTwoFirstChildWidgetBytes[] = {
+    0x48,0x83,0xEC,0x28, 0xE8,0x27,0xC6,0x4E,0xFF, 0x48,0x85,0xC0, 0x74,0x27,
+    0x44,0x8B,0x05,0xD3,0xBA,0x64,0x07, 0x48,0x8B,0x48,0x40, 0x41,0x8B,0xD0,
+    0x48,0xC1,0xEA,0x06, 0x41,0x83,0xE0,0x3F, 0xC4,0xE2,0xBB,0xF7,0x4C,0xD1,0x28,
+    0xF6,0xC1,0x01, 0x74,0x05, 0x4C,0x8B,0xC8, 0xEB,0x0B, 0x45,0x33,0xC9,
+    0x48,0x85,0xC0, 0x74,0x43, 0x0F,0x1F,0x00, 0x4D,0x85,0xC9, 0x74,0x06,
+    0xF6,0x40,0x0C,0x01, 0x74,0x35
+};
+
+static const uint8_t partTwoLFirstChildWidgetBytes[] = {
+    0x48,0x83,0xEC,0x28, 0xE8,0xF7,0x76,0x4D,0xFF, 0x48,0x85,0xC0, 0x74,0x27,
+    0x8B,0x0D,0xB4,0xAD,0x65,0x07, 0x48,0x8B,0x50,0x40, 0x44,0x8B,0xC1,
+    0x49,0xC1,0xE8,0x06, 0x80,0xE1,0x3F, 0x4E,0x8B,0x44,0xC2,0x28, 0x49,0xD3,0xE8,
+    0x41,0xF6,0xC0,0x01, 0x74,0x05, 0x4C,0x8B,0xC8, 0xEB,0x0B, 0x45,0x33,0xC9,
+    0x48,0x85,0xC0, 0x74,0x46, 0x0F,0x1F,0x00, 0x4D,0x85,0xC9, 0x74,0x06,
+    0xF6,0x40,0x0C,0x01, 0x74,0x38
+};
+
+/* The component check, the whole function: tlou-ii.exe 01FF6540, then
+   tlou-ii-l.exe 02025710. */
+static const uint8_t partTwoAsComponentBytes[] = {
+    0x33,0xC0, 0x48,0x85,0xC9, 0x74,0x25, 0x44,0x8B,0x0D,0x4A,0xEC,0x58,0x07,
+    0x48,0x8B,0x51,0x40, 0x45,0x8B,0xC1, 0x49,0xC1,0xE9,0x06,
+    0x41,0x83,0xE0,0x3F, 0xC4,0x22,0xBB,0xF7,0x44,0xCA,0x28,
+    0x41,0xF6,0xC0,0x01, 0x48,0x0F,0x45,0xC1, 0xC3
+};
+
+static const uint8_t partTwoLAsComponentBytes[] = {
+    0x33,0xC0, 0x4C,0x8B,0xC9, 0x48,0x85,0xC9, 0x74,0x26,
+    0x44,0x8B,0x05,0x77,0x7A,0x59,0x07, 0x49,0x8B,0x51,0x40,
+    0x41,0x0F,0xB6,0xC8, 0x49,0xC1,0xE8,0x06, 0x80,0xE1,0x3F,
+    0x4E,0x8B,0x44,0xC2,0x28, 0x49,0xD3,0xE8, 0x41,0xF6,0xC0,0x01,
+    0x49,0x0F,0x45,0xC1, 0xC3
+};
+
+/* 1 once the build's asComponent, parentWidget, handleResolve and
+   firstChildWidget stood at their addresses. Rows are held, and asComponent
+   and parentWidget called, only then. */
 static int global_rowsFollowed = 0;
 
 static int sameBytesAt(uint64_t rva, const uint8_t* bytes, size_t length) {
@@ -4331,20 +6215,25 @@ static int sameBytesAt(uint64_t rva, const uint8_t* bytes, size_t length) {
     return same;
 }
 
+/* Whether code stands at its address as expected. */
+static int codeAsExpected(const ExpectedCode& code) {
+    return code.rva && code.bytes
+        && sameBytesAt(code.rva, code.bytes, code.length);
+}
+
 static void checkRowLayout() {
-    const int parent = sameBytesAt(PARENT_WIDGET_RVA, parentWidgetBytes,
-                                   sizeof(parentWidgetBytes));
-    const int resolve = sameBytesAt(HANDLE_RESOLVE_RVA, handleResolveBytes,
-                                    sizeof(handleResolveBytes));
-    const int child = sameBytesAt(FIRST_CHILD_WIDGET_RVA, firstChildWidgetBytes,
-                                  sizeof(firstChildWidgetBytes));
-    global_rowsFollowed = parent && resolve && child;
+    const int parent = codeAsExpected(global_game->parentWidget);
+    const int resolve = codeAsExpected(global_game->handleResolve);
+    const int child = codeAsExpected(global_game->firstChildWidget);
+    const int component = codeAsExpected(global_game->asComponent);
+    global_rowsFollowed = parent && resolve && child && component;
     if (!global_rowsFollowed)
         writeLog("LOCK the game's %s is not the code expected, so no row is "
                  "held and a lock is drawn only when its page is opened again",
                  !parent ? "parent widget lookup"
                  : !resolve ? "handle resolve"
-                            : "child widget walk");
+                 : !child ? "child widget walk"
+                          : "component check");
 }
 
 typedef uint64_t (*RefreshFromSourceFn)(uint64_t widget, uint64_t source);
@@ -4358,20 +6247,24 @@ static uint64_t widgetMethod(uint64_t widget, unsigned slot) {
 
 /* The data source a component holds, or 0. */
 static uint64_t sourceOfComponent(uint64_t component, const char* during) {
-    const uint64_t get = widgetMethod(component, WIDGET_GET_DATA_SOURCE);
+    if (!global_game) return 0;
+    const uint64_t get = widgetMethod(component,
+                                      global_game->widgetGetDataSource);
     return get ? callEngine(get, component, during) : 0;
 }
 
 static uint64_t componentOfWidget(uint64_t widget) {
-    if (!widget || !global_moduleBase) return 0;
-    return callEngine(global_moduleBase + AS_COMPONENT_RVA, widget,
+    if (!widget || !global_moduleBase || !global_game || !global_rowsFollowed)
+        return 0;
+    return callEngine(global_moduleBase + global_game->asComponent.rva, widget,
                       "asking whether a widget is a component");
 }
 
 static uint64_t parentOfWidget(uint64_t widget) {
-    if (!widget || !global_moduleBase) return 0;
-    return callEngine(global_moduleBase + PARENT_WIDGET_RVA, widget,
-                      "asking for a widget's parent");
+    if (!widget || !global_moduleBase || !global_game || !global_rowsFollowed)
+        return 0;
+    return callEngine(global_moduleBase + global_game->parentWidget.rva,
+                      widget, "asking for a widget's parent");
 }
 
 /* The widget the handle names now, or 0 where it has been freed, the record
@@ -4382,8 +6275,9 @@ static uint64_t widgetOfHandle(uint64_t record, uint32_t id) {
     GUARD_TRY {
         widget = *(volatile uint64_t*)(record + RECORD_OBJECT);
         if (!isPointer(widget)
-            || *(volatile uint32_t*)(widget + ROW_ID) != id
-            || (*(volatile uint8_t*)(widget + ROW_STATE) & ROW_DEAD))
+            || *(volatile uint32_t*)(widget + global_game->rowId) != id
+            || (*(volatile uint8_t*)(widget + global_game->rowState)
+                & ROW_DEAD))
             widget = 0;
     } GUARD_EXCEPT_DESCRIBING("following a row by its handle") { widget = 0; }
     return widget;
@@ -4396,12 +6290,12 @@ static uint64_t rowNow(const OurSetting* s) {
 
 /* Holds the row at component by its handle. 1 where the handle names it. */
 static int holdRow(OurSetting* s, uint64_t component) {
-    if (!isPointer(component)) return 0;
+    if (!global_rowsFollowed || !isPointer(component)) return 0;
     uint64_t record = 0;
     uint32_t id = 0;
     GUARD_TRY {
-        record = *(volatile uint64_t*)(component + ROW_RECORD);
-        id = *(volatile uint32_t*)(component + ROW_ID);
+        record = *(volatile uint64_t*)(component + global_game->rowRecord);
+        id = *(volatile uint32_t*)(component + global_game->rowId);
     } GUARD_EXCEPT_DESCRIBING("taking a row's handle") { record = 0; id = 0; }
     if (widgetOfHandle(record, id) != component) return 0;
     s->rowRecord = record;
@@ -4443,7 +6337,8 @@ static void refreshControl(OurSetting* s) {
         s->rowId = 0;
         return;
     }
-    const uint64_t refresh = widgetMethod(row, WIDGET_REFRESH_SOURCE);
+    const uint64_t refresh = widgetMethod(row,
+                                          global_game->widgetRefreshSource);
     if (!refresh) return;
     GUARD_TRY {
         ((RefreshFromSourceFn)refresh)(row, 0);
@@ -4453,11 +6348,11 @@ static void refreshControl(OurSetting* s) {
 /*
     Focus, and moving it off a row that is hidden while it has it.
 
-        HAS_FOCUS_RVA        whether a component is the one the menu root's
-                             focus is on: (component) -> a byte
-        COMPONENT_EVENT_RVA  an event from a component, handed to every widget
-                             above it: (component, event id, sixteen bytes,
-                             sixteen bytes)
+        hasFocus         whether a component is the one the menu root's focus
+                         is on: (component) -> a byte
+        componentEvent   an event from a component, handed to every widget
+                         above it: (component, event id, sixteen bytes,
+                         sixteen bytes)
 
     A container handed focused-component-disabled by one of its own children
     moves focus to the first child after it that can take focus, or to its
@@ -4465,23 +6360,62 @@ static void refreshControl(OurSetting* s) {
     with both sixteen byte values zero, when it disables the row that has
     focus.
 
-    Both are called only where these bytes stand at their addresses.
+    Both are called only where the build's bytes stand at their addresses,
+    and its focusHolder too where it has one.
 */
-#define HAS_FOCUS_RVA        0x0266275Cull
-#define COMPONENT_EVENT_RVA  0x02661028ull
 
-static const uint8_t hasFocusBytes[] = {
+/* tlou-i.exe 1.1.5.0: hasFocus (0266275C) and componentEvent (02661028). */
+static const uint8_t partOneHasFocusBytes[] = {
     0x48,0x83,0xEC,0x28, 0x4C,0x8B,0xC9, 0xE8,0x10,0xEB,0xD0,0xFF,
     0x48,0x8D,0x88,0x40,0x05,0x00,0x00, 0xE8,0xCC,0x04,0x11,0xFF,
     0x49,0x3B,0xC1, 0x0F,0x94,0xC0, 0x48,0x83,0xC4,0x28, 0xC3
 };
 
-static const uint8_t componentEventBytes[] = {
+static const uint8_t partOneComponentEventBytes[] = {
     0x48,0x89,0x5C,0x24,0x10, 0x48,0x89,0x74,0x24,0x18, 0x55, 0x57,
     0x41,0x54, 0x41,0x56, 0x41,0x57, 0x48,0x8D,0xAC,0x24,0x30,0xFF,0xFF,0xFF,
     0x48,0x81,0xEC,0xD0,0x01,0x00,0x00, 0x48,0x8B,0x05,0xB8,0xEB,0xF5,0x00,
     0x48,0x33,0xC4, 0x48,0x89,0x85,0xC8,0x00,0x00,0x00, 0x4D,0x8B,0xF1,
     0x4D,0x8B,0xF8, 0x48,0x8B,0xDA, 0x48,0x8B,0xF1
+};
+
+/*
+    tlou-ii.exe and tlou-ii-l.exe 1.6.0. hasFocus asks the menu root's focus
+    holder (tlou-ii.exe 01B3E830, tlou-ii-l.exe 01B5FDE0), which reads the
+    holder at root+0x4C0 and its id at root+0x4C8: its opening, the same in
+    both. Then hasFocus (tlou-ii.exe 01FF7500, tlou-ii-l.exe 02026700) and the
+    opening of componentEvent (tlou-ii.exe 01FF57E0, tlou-ii-l.exe 02024990)
+    of each.
+*/
+static const uint8_t partTwoFocusHolderBytes[] = {
+    0x48,0x8B,0x81,0xC0,0x04,0x00,0x00, 0x48,0x85,0xC0, 0x74,0x22,
+    0x8B,0x89,0xC8,0x04,0x00,0x00
+};
+
+static const uint8_t partTwoHasFocusBytes[] = {
+    0x40,0x53, 0x48,0x83,0xEC,0x20, 0x48,0x8B,0xD9, 0xE8,0xE2,0x6C,0xB4,0xFF,
+    0x48,0x8B,0xC8, 0xE8,0x1A,0x73,0xB4,0xFF, 0x48,0x3B,0xC3, 0x0F,0x94,0xC0,
+    0x48,0x83,0xC4,0x20, 0x5B, 0xC3
+};
+
+static const uint8_t partTwoLHasFocusBytes[] = {
+    0x40,0x53, 0x48,0x83,0xEC,0x20, 0x48,0x8B,0xD9, 0xE8,0x92,0x90,0xB3,0xFF,
+    0x48,0x8B,0xC8, 0xE8,0xCA,0x96,0xB3,0xFF, 0x48,0x3B,0xC3, 0x0F,0x94,0xC0,
+    0x48,0x83,0xC4,0x20, 0x5B, 0xC3
+};
+
+static const uint8_t partTwoComponentEventBytes[] = {
+    0x40,0x53, 0x55, 0x56, 0x57, 0x41,0x54, 0x41,0x56, 0x41,0x57,
+    0x48,0x81,0xEC,0xA0,0x01,0x00,0x00, 0x48,0x8B,0x05,0x3F,0x3A,0x89,0x01,
+    0x48,0x33,0xC4, 0x48,0x89,0x84,0x24,0x98,0x01,0x00,0x00,
+    0x4D,0x8B,0xF1, 0x49,0x8B,0xE8, 0x48,0x8B,0xDA, 0x48,0x8B,0xF1
+};
+
+static const uint8_t partTwoLComponentEventBytes[] = {
+    0x40,0x53, 0x55, 0x56, 0x57, 0x41,0x54, 0x41,0x56, 0x41,0x57,
+    0x48,0x81,0xEC,0xA0,0x01,0x00,0x00, 0x48,0x8B,0x05,0x9F,0xC8,0x89,0x01,
+    0x48,0x33,0xC4, 0x48,0x89,0x84,0x24,0x98,0x01,0x00,0x00,
+    0x4D,0x8B,0xF1, 0x49,0x8B,0xE8, 0x48,0x8B,0xDA, 0x48,0x8B,0xF1
 };
 
 typedef uint8_t (*HasFocusFn)(uint64_t component);
@@ -4493,10 +6427,10 @@ static uint64_t global_focusedComponentDisabledId = 0;
 
 static void checkFocusCalls() {
     global_focusedComponentDisabledId = hashText("focused-component-disabled");
-    global_focusKnown =
-        sameBytesAt(HAS_FOCUS_RVA, hasFocusBytes, sizeof(hasFocusBytes))
-        && sameBytesAt(COMPONENT_EVENT_RVA, componentEventBytes,
-                       sizeof(componentEventBytes));
+    const GameBuild* g = global_game;
+    global_focusKnown = codeAsExpected(g->hasFocus)
+                     && codeAsExpected(g->componentEvent)
+                     && (!g->focusHolder.rva || codeAsExpected(g->focusHolder));
     if (!global_focusKnown)
         writeLog("FOCUS the game's focus check or component event is not the "
                  "code expected, so a row hidden while it has focus keeps it");
@@ -4507,7 +6441,8 @@ static int rowHasFocus(uint64_t row) {
     if (!global_focusKnown || !row) return 0;
     int focused = 0;
     GUARD_TRY {
-        focused = ((HasFocusFn)(global_moduleBase + HAS_FOCUS_RVA))(row) != 0;
+        focused = ((HasFocusFn)(global_moduleBase
+                                + global_game->hasFocus.rva))(row) != 0;
     } GUARD_EXCEPT_DESCRIBING("asking whether a row has focus") { focused = 0; }
     return focused;
 }
@@ -4520,56 +6455,10 @@ static void moveFocusOff(uint64_t row) {
     memset(first, 0, sizeof(first));
     memset(second, 0, sizeof(second));
     GUARD_TRY {
-        ((ComponentEventFn)(global_moduleBase + COMPONENT_EVENT_RVA))(
+        ((ComponentEventFn)(global_moduleBase
+                            + global_game->componentEvent.rva))(
             row, global_focusedComponentDisabledId, first, second);
     } GUARD_EXCEPT_DESCRIBING("moving focus off a row that was hidden") { }
-}
-
-/*
-    The page on top of a page stack, and the name of a page of ours.
-
-        TOP_PAGE_RVA   the top page of a stack: its last child that is a page
-                       and is not being popped
-        PAGE_NAME_ID   a page's name id, the hash of the name it was pushed by
-
-    The top page is asked for only where these bytes stand at its address.
-*/
-#define TOP_PAGE_RVA   0x0253FE88ull
-#define PAGE_NAME_ID   0x1A8
-
-static const uint8_t topPageBytes[] = {
-    0x48,0x83,0xEC,0x28, 0xE8,0x4B,0xA2,0x00,0x00, 0xEB,0x11,
-    0xF6,0x80,0x21,0x09,0x00,0x00,0x01, 0x74,0x15, 0x48,0x8B,0xC8,
-    0xE8,0xE8,0xA4,0x00,0x00, 0x48,0x8B,0xC8, 0xE8,0x94,0xA6,0x73,0xFF,
-    0x48,0x85,0xC0, 0x75,0xE2, 0x48,0x83,0xC4,0x28, 0xC3
-};
-
-static int global_topPageKnown = 0;
-
-static void checkTopPage() {
-    global_topPageKnown = sameBytesAt(TOP_PAGE_RVA, topPageBytes,
-                                      sizeof(topPageBytes));
-    if (!global_topPageKnown)
-        writeLog("PAGE the game's top page lookup is not the code expected, so "
-                 "a page is named by the last one pushed");
-}
-
-/* The page on top of stack, or 0. */
-static uint64_t topPageOf(uint64_t stack) {
-    if (!global_topPageKnown || !isPointer(stack)) return 0;
-    return callEngine(global_moduleBase + TOP_PAGE_RVA, stack,
-                      "asking a page stack for its top page");
-}
-
-/* The name of a page of ours, by the id it carries, or nullptr. */
-static const char* pageNameOf(uint64_t page) {
-    uint64_t id = 0;
-    if (page < SMALLEST_POINTER || !readQword(page + PAGE_NAME_ID, &id) || !id)
-        return nullptr;
-    for (int i = 0; i < global_menuFileCount; ++i)
-        if (hashText(global_menuFiles[i].name) == id)
-            return global_menuFiles[i].name;
-    return nullptr;
 }
 
 /* The comma separated list a set of items composes, written in file order. */
@@ -4657,6 +6546,59 @@ static void dressLockedText(const char* text, char* out, size_t size) {
     if (colour[0]) strcat_s(out, size, "</font>");
 }
 
+/*
+    What the engine is handed below a control's description while the control
+    is locked, into out, as ourGetDependencyDescriptionId hands it over: text,
+    the dependency text the control shows, as it is written where markup is 1
+    and with "<", ">" and "&" written as entities where it is 0, dressed by
+    dressLockedText.
+
+    room    bytes at out, MAX_SHOWN_TEXT + MAX_LOCKED_MARKUP or more
+*/
+static void lockedTextOf(const char* text, int markup, char* out, size_t room) {
+    char shown[MAX_SHOWN_TEXT];
+    if (markup)
+        copyBounded(shown, sizeof(shown), text, "dependency description");
+    else escapeForMarkup(text, shown, sizeof(shown));
+    dressLockedText(shown, out, room);
+}
+
+/*
+    Whether text, the dependency text a control shows while it is locked, can
+    be drawn as the engine is handed it: as lockedTextOf makes it from text and
+    markup, with "<", ">" and "&" written as entities where markup is 0, then
+    dressed by dressLockedText. A control whose text cannot be drawn shows
+    none while it is locked.
+*/
+static int dependencyTextIsSafe(const char* text, int markup) {
+    char drawn[MAX_SHOWN_TEXT + MAX_LOCKED_MARKUP];
+    lockedTextOf(text, markup, drawn, sizeof(drawn));
+    return fatalPipeAt(drawn) < 0 && fatalTagAt(drawn) < 0;
+}
+
+/*
+    While a control is locked, the description pane draws its description, a
+    space, and the text lockedTextOf makes from the control's dependency text,
+    as one piece of markup. handed is the description as the engine is handed
+    it, as markup, and dependency and markup are as for lockedTextOf.
+
+    Answers where the first "<" in handed is that the engine cannot draw in
+    that piece, or -1. A "<" after handed's end is not answered. Answers -1
+    where dependency is empty, as the pane then draws the description alone.
+*/
+static int fatalTagWhenLockedAt(const char* handed, const char* dependency,
+                                int markup) {
+    if (!dependency[0]) return -1;
+    char joined[MODPAGE_EXPRESSION * 4 + 2 + MAX_SHOWN_TEXT
+                + MAX_LOCKED_MARKUP];
+    if (!formatInto(joined, sizeof(joined), "%s ", handed)) return -1;
+    const size_t length = strlen(joined) - 1;
+    lockedTextOf(dependency, markup, joined + length + 1,
+                 sizeof(joined) - length - 1);
+    const int at = fatalTagAt(joined);
+    return at >= 0 && (size_t)at < length ? at : -1;
+}
+
 /* ----------------------------------------------------------- expressions */
 
 /*
@@ -4677,8 +6619,8 @@ static void dressLockedText(const char* text, char* out, size_t size) {
         LET(name, value, name, value, ..., result)
                                     the result, with each name standing for
                                     its value. A value may use the names before
-                                    it, and is worked out only when its name is
-                                    read
+                                    it, and is worked out only when its name,
+                                    or a name after it, is read
         CHOOSE(position, value, value, ...)
                                     the value at the position, counted from 1
         SETTING(text)               the control or settings file key the text
@@ -4712,7 +6654,18 @@ static void dressLockedText(const char* text, char* out, size_t size) {
 */
 
 #define EXPRESSION_TEXT   1024
-#define EXPRESSION_DEPTH  32
+/*
+    How deep an expression may nest. Every value counts one level while it is
+    being worked out, and so does every unary minus, the minus of a negative
+    number such as -1 included, and every NOT. What is inside brackets, a
+    function's values and a formula's expression are worked out inside the
+    value that holds them, and a LET name's value inside the value that first
+    reads the name or a name after it in the same LET, and again inside a less
+    deep one where it faulted or met a value nested too deep (see
+    bindingWantsWorking). A level takes up to about 16 KB of stack, so the
+    deepest expression takes about 220 KB.
+*/
+#define EXPRESSION_DEPTH  13
 
 struct ExpressionValue {
     int    isNumber;
@@ -4724,15 +6677,26 @@ struct ExpressionValue {
     A name a LET or a formula call gives a value to.
 
     from/to  the text of a LET name's value, worked out the first time the
-             name is read; both null for a formula's parameter, whose value is
-             worked out before the call
-    state    0 not worked out, 1 being worked out, 2 worked out
+             name or a name after it in the same LET is read, and again where
+             bindingWantsWorking says; both null for a formula's parameter,
+             whose value is worked out before the call
+    state    0 not worked out, 1 being worked out, 2 worked out, 3 worked out
+             and faulted
+    depth    for a LET name in state 2 or 3, the depth of the cursor it was
+             last worked out from
+    tooDeep  for states 2 and 3, working it out met a value nested deeper than
+             EXPRESSION_DEPTH, whether or not IFERROR answered in its place;
+             0 for a formula's parameter
+    fault    for state 3, the fault
 */
 struct ExpressionBinding {
     char            name[MODPAGE_NAME];
     const char*     from;
     const char*     to;
     int             state;
+    int             depth;
+    int             tooDeep;
+    char            fault[160];
     ExpressionValue value;
 };
 
@@ -4759,6 +6723,9 @@ struct ExpressionScope {
     value       being worked out for
     scope       the names in force; scopeLimit is how many of its own count,
                 since a LET value reads only the names before its own
+    depth       how many levels deep the cursor is, up to EXPRESSION_DEPTH
+    tooDeep     a value nested deeper than EXPRESSION_DEPTH was met. IFERROR
+                clears the fault that raises, but not this
 */
 struct ExpressionCursor {
     const char*       at;
@@ -4771,6 +6738,7 @@ struct ExpressionCursor {
     ExpressionScope*  scope;
     int               scopeLimit;
     int               depth;
+    int               tooDeep;
     int               faulted;
     char              fault[160];
     /* Which controls the expression read. Filled whether or not anyone
@@ -4798,6 +6766,19 @@ static void expressionFault(ExpressionCursor* c, const char* what,
     describeFault(c->fault, sizeof(c->fault), what, about);
 }
 
+/* The fault enterLevel raises. */
+#define NESTED_TOO_DEEP "this is nested deeper than an expression may be"
+
+/* One level deeper. Answers 0, with the fault raised and the cursor marked
+   tooDeep, where that is deeper than EXPRESSION_DEPTH. The caller takes the
+   level off again either way. */
+static int enterLevel(ExpressionCursor* c) {
+    if (++c->depth <= EXPRESSION_DEPTH) return 1;
+    c->tooDeep = 1;
+    expressionFault(c, NESTED_TOO_DEEP, 0);
+    return 0;
+}
+
 static void valueFromNumber(ExpressionValue* v, double number) {
     v->isNumber = 1;
     v->number = number;
@@ -4807,14 +6788,15 @@ static void valueFromNumber(ExpressionValue* v, double number) {
 static void valueFromText(ExpressionValue* v, const char* text) {
     v->isNumber = 0;
     v->number = 0.0;
-    copyBounded(v->text, sizeof(v->text), text, "an expression value");
+    copyBounded(v->text, sizeof(v->text), text, "expression value");
 }
 
-/* A value as text, a number written as short as it can be. */
+/* A value as text, a number written as short as it can be. capped is as
+   copyBounded takes it. */
 static void valueText(const ExpressionValue* v, char* out, size_t room,
-                      const char* what) {
+                      const char* what, int capped = 0) {
     if (v->isNumber) writeNumber(out, room, (float)v->number);
-    else copyBounded(out, room, v->text, what);
+    else copyBounded(out, room, v->text, what, capped);
 }
 
 /* Text that spells a number counts as one, so a setting kept as "2.5" compares
@@ -4903,9 +6885,10 @@ static void expressionOr(ExpressionCursor* c, ExpressionValue* out);
 static void valueOfName(ExpressionCursor* c, const char* name,
                         ExpressionValue* out) {
     char section[MODPAGE_NAME], whole[MODPAGE_NAME * 2];
-    copyBounded(whole, sizeof(whole), name, "a name in an expression");
+    copyBounded(whole, sizeof(whole), name, "setting name in an expression");
     const char* key = splitSettingName(whole, 1, c->owner, section,
-                                       sizeof(section), "an expression section");
+                                       sizeof(section),
+                                       "section in an expression");
 
     const char* path = c->owner ? c->owner->storePath : 0;
     const OurSetting* s = settingNamed(path, section, key);
@@ -4915,11 +6898,14 @@ static void valueOfName(ExpressionCursor* c, const char* name,
         if (!already && c->readCount < EXPRESSION_READS)
             c->read[c->readCount++] = s;
         if (s->kind == KIND_SLIDER) valueFromNumber(out, (double)s->value);
+        else if (s == global_steppedControl)
+            valueFromText(out, s->optionValue[global_steppedOption]);
         else valueFromText(out, s->index >= 0 && s->index < s->optionCount
                                 ? s->optionValue[s->index] : s->shown);
         return;
     }
 
+    InterlockedIncrement(&global_namesReadFromStore);
     char held[MAX_SETTING_TEXT];
     storedText(path, section, key, "", held, sizeof(held));
     if (held[0]) { valueFromText(out, held); return; }
@@ -4942,7 +6928,8 @@ static int functionWordAt(ExpressionCursor* c, const char* word) {
     The text from..to worked out as one value on a cursor that begins as a copy
     of c, with scope and the first limit of its names in force. The controls
     it read are taken into c. Answers whether it faulted; the fault is in
-    inner.
+    inner. inner->tooDeep says whether a value nested too deep was met there,
+    and is left to the caller to take into c.
 */
 static int workOutInside(ExpressionCursor* c, ExpressionCursor* inner,
                          const char* from, const char* to,
@@ -4953,6 +6940,7 @@ static int workOutInside(ExpressionCursor* c, ExpressionCursor* inner,
     inner->end = to;
     inner->scope = scope;
     inner->scopeLimit = limit;
+    inner->tooDeep = 0;
     inner->faulted = 0;
     inner->fault[0] = 0;
     expressionOr(inner, out);
@@ -4969,8 +6957,48 @@ static int workOutInside(ExpressionCursor* c, ExpressionCursor* inner,
     return inner->faulted;
 }
 
-/* A LET name or a formula parameter in force at the cursor. Answers 1 where
-   name is one, with its value in out. */
+/*
+    Binding i of scope worked out from the cursor c: state 2 with its value,
+    or state 3 with its fault, which is not raised on c. Answers whether it
+    was worked out.
+*/
+static int workOutBinding(ExpressionCursor* c, ExpressionScope* scope, int i) {
+    ExpressionBinding* b = &scope->binding[i];
+    b->state = 1;
+    ExpressionCursor inner;
+    const int faulted = workOutInside(c, &inner, b->from, b->to, scope, i,
+                                      &b->value);
+    b->state = faulted ? 3 : 2;
+    b->depth = c->depth;
+    b->tooDeep = inner.tooDeep;
+    strcpy_s(b->fault, sizeof(b->fault), inner.fault);
+    return !faulted;
+}
+
+/*
+    Whether binding b is worked out where it is read from the cursor c: where
+    it has not been, and where it faulted, or met a value nested deeper than
+    EXPRESSION_DEPTH, when it was worked out from a cursor deeper than c.
+*/
+static int bindingWantsWorking(const ExpressionBinding* b,
+                               const ExpressionCursor* c) {
+    return b->state == 0
+        || ((b->state == 3 || (b->state == 2 && b->tooDeep))
+            && c->depth < b->depth);
+}
+
+/*
+    A LET name or a formula parameter in force at the cursor. Answers 1 where
+    name is one, with its value in out.
+
+    Before a LET name is worked out, the names before it in the same LET that
+    bindingWantsWorking picks are worked out, in order and each from this
+    cursor, so a name whose value reads the name before it is worked out one
+    level inside the reader however long the chain. One of them that faults
+    keeps its fault, which is raised only where its own name is read. A name
+    that faulted or met a value nested too deep is worked out again where it
+    is read from a cursor less deep than the one it was worked out from.
+*/
 static int valueOfLocalName(ExpressionCursor* c, const char* name,
                             ExpressionValue* out) {
     ExpressionScope* scope = c->scope;
@@ -4983,16 +7011,16 @@ static int valueOfLocalName(ExpressionCursor* c, const char* name,
                 expressionFault(c, "a LET name is worked out from itself", name);
                 return 1;
             }
-            if (b->state == 0) {
-                b->state = 1;
-                ExpressionCursor inner;
-                if (workOutInside(c, &inner, b->from, b->to, scope, i,
-                                  &b->value)) {
-                    b->state = 0;
-                    expressionFault(c, inner.fault, 0);
-                    return 1;
-                }
-                b->state = 2;
+            if (bindingWantsWorking(b, c)) {
+                for (int j = 0; j < i; ++j)
+                    if (bindingWantsWorking(&scope->binding[j], c))
+                        workOutBinding(c, scope, j);
+                workOutBinding(c, scope, i);
+            }
+            if (b->tooDeep) c->tooDeep = 1;
+            if (b->state == 3) {
+                expressionFault(c, b->fault, 0);
+                return 1;
             }
             *out = b->value;
             return 1;
@@ -5030,9 +7058,16 @@ static void expressionLet(ExpressionCursor* c, ExpressionValue* out) {
         return;
     }
 
+    /* The names are kept on the heap. Each holds a whole value, about 1 KB,
+       and the stack EXPRESSION_DEPTH allows for a level has no room for 16 of
+       them. */
     const int names = (arguments - 1) / 2;
     ExpressionBinding* binding =
-        (ExpressionBinding*)_alloca(sizeof(ExpressionBinding) * (size_t)names);
+        (ExpressionBinding*)malloc(sizeof(ExpressionBinding) * (size_t)names);
+    if (!binding) {
+        expressionFault(c, "there was no memory for the names LET gives", 0);
+        return;
+    }
     for (int n = 0; n < names; ++n) {
         const char* nameFrom = from[2 * n];
         const char* nameTo = nameFrom;
@@ -5044,6 +7079,7 @@ static void expressionLet(ExpressionCursor* c, ExpressionValue* out) {
             c->at = nameFrom;
             expressionFault(c, "LET gives a value to something that is not a "
                                "name it can have", nameFrom);
+            free(binding);
             return;
         }
         ExpressionBinding* b = &binding[n];
@@ -5052,6 +7088,7 @@ static void expressionLet(ExpressionCursor* c, ExpressionValue* out) {
         b->from = from[2 * n + 1];
         b->to = to[2 * n + 1];
         b->state = 0;
+        b->tooDeep = 0;
     }
 
     ExpressionScope scope = { c->scope, c->scopeLimit, binding, names };
@@ -5061,7 +7098,38 @@ static void expressionLet(ExpressionCursor* c, ExpressionValue* out) {
     expressionOr(c, out);
     c->scope = scope.outer;
     c->scopeLimit = scope.outerLimit;
+    free(binding);
     if (!c->faulted) expect(c, ')', "LET was not closed");
+}
+
+/*
+    Whether fault already holds said, "in the formula <name>", where
+    callFormula puts it: among the names it puts before a fault, each followed
+    by ": ", as in "in the formula a: in the formula b: <fault>", or among
+    those it puts after the depth refusal, each after ", ", as in
+    "<NESTED_TOO_DEEP>, in the formula a, in the formula b". Text the menupage
+    wrote, which a fault may quote after its own words, is not looked at.
+*/
+static int faultNamesFormula(const char* fault, const char* said) {
+    static const char lead[] = "in the formula ";
+    const size_t leadLength = sizeof(lead) - 1, length = strlen(said);
+    const size_t refusalLength = strlen(NESTED_TOO_DEEP);
+    const char* at = fault;
+    while (strncmp(at, lead, leadLength) == 0) {
+        if (strncmp(at, said, length) == 0 && at[length] == ':') return 1;
+        for (at += leadLength; nameCharacter(*at); ++at) {}
+        if (strncmp(at, ": ", 2) != 0) return 0;
+        at += 2;
+    }
+    if (strncmp(at, NESTED_TOO_DEEP, refusalLength) != 0) return 0;
+    for (at += refusalLength; strncmp(at, ", ", 2) == 0
+                              && strncmp(at + 2, lead, leadLength) == 0;) {
+        at += 2;
+        if (strncmp(at, said, length) == 0
+            && (at[length] == ',' || !at[length])) return 1;
+        for (at += leadLength; nameCharacter(*at); ++at) {}
+    }
+    return 0;
 }
 
 /* A call of a formula, after its bracket. */
@@ -5069,14 +7137,21 @@ static void callFormula(ExpressionCursor* c, const PageFormula* f,
                         ExpressionValue* out) {
     char what[MODPAGE_NAME + 48];
     const int count = f->parameterCount;
+    /* The parameters are kept on the heap, as LET keeps its names. */
     ExpressionBinding* binding = count
-        ? (ExpressionBinding*)_alloca(sizeof(ExpressionBinding) * (size_t)count)
+        ? (ExpressionBinding*)malloc(sizeof(ExpressionBinding) * (size_t)count)
         : 0;
+    if (count && !binding) {
+        sprintf_s(what, "there was no memory to call the formula %s", f->name);
+        expressionFault(c, what, 0);
+        return;
+    }
     for (int p = 0; p <= count; ++p) {
         if (p == count ? !expressionCharacterAt(c, ')')
                        : p && !expressionCharacterAt(c, ',')) {
             sprintf_s(what, "the formula %s takes %d value(s)", f->name, count);
             expressionFault(c, what, 0);
+            free(binding);
             return;
         }
         if (p == count) break;
@@ -5085,17 +7160,39 @@ static void callFormula(ExpressionCursor* c, const PageFormula* f,
         b->from = 0;
         b->to = 0;
         b->state = 2;
+        b->tooDeep = 0;
         expressionOr(c, &b->value);
-        if (c->faulted) return;
+        if (c->faulted) {
+            free(binding);
+            return;
+        }
     }
 
     ExpressionScope scope = { 0, 0, binding, count };
     ExpressionCursor inner;
-    if (workOutInside(c, &inner, f->body, f->body + strlen(f->body), &scope,
-                      count, out)) {
+    const int faulted = workOutInside(c, &inner, f->body,
+                                      f->body + strlen(f->body), &scope, count,
+                                      out);
+    if (inner.tooDeep) c->tooDeep = 1;
+    if (faulted) {
+        /* A fault is said to be in this formula, after the fault where it is
+           the depth refusal, so that its cause comes first, and before it
+           otherwise. One that this function has already said is in this
+           formula, as one in a formula that calls itself is, is not said to
+           be in it again. */
         sprintf_s(what, "in the formula %s", f->name);
-        expressionFault(c, what, inner.fault);
+        if (faultNamesFormula(inner.fault, what))
+            expressionFault(c, inner.fault, 0);
+        else if (strncmp(inner.fault, NESTED_TOO_DEEP,
+                         strlen(NESTED_TOO_DEEP)) == 0) {
+            const size_t used = strlen(inner.fault);
+            _snprintf_s(inner.fault + used, sizeof(inner.fault) - used,
+                        _TRUNCATE, ", %s", what);
+            expressionFault(c, inner.fault, 0);
+        } else
+            expressionFault(c, what, inner.fault);
     }
+    free(binding);
 }
 
 /*
@@ -5168,7 +7265,7 @@ static void expressionFunction(ExpressionCursor* c, ExpressionValue* out,
         ExpressionValue named;
         if (!oneValue(c, "SETTING", 0, &named)) return;
         char name[MODPAGE_NAME * 2];
-        valueText(&named, name, sizeof(name), "a setting name");
+        valueText(&named, name, sizeof(name), "name given to SETTING", 1);
         if (!name[0]) {
             expressionFault(c, "SETTING was given no name", 0);
             return;
@@ -5371,10 +7468,7 @@ static void primaryValue(ExpressionCursor* c, ExpressionValue* out) {
 
 static void expressionPrimary(ExpressionCursor* c, ExpressionValue* out) {
     valueFromNumber(out, 0.0);
-    if (++c->depth > EXPRESSION_DEPTH)
-        expressionFault(c, "this is nested deeper than an expression may be", 0);
-    else
-        primaryValue(c, out);
+    if (enterLevel(c)) primaryValue(c, out);
     --c->depth;
 }
 
@@ -5385,7 +7479,9 @@ static void expressionUnary(ExpressionCursor* c, ExpressionValue* out) {
         return;
     }
     ++c->at;
-    expressionUnary(c, out);
+    valueFromNumber(out, 0.0);
+    if (enterLevel(c)) expressionUnary(c, out);
+    --c->depth;
     double number = 0.0;
     if (!valueAsNumber(out, &number))
         expressionFault(c, "this cannot be made negative", out->text);
@@ -5448,8 +7544,8 @@ static void expressionCompare(ExpressionCursor* c, ExpressionValue* out) {
                           a <= b, a >= b);
     else {
         char left[EXPRESSION_TEXT], right[EXPRESSION_TEXT];
-        valueText(out, left, sizeof(left), "a comparison");
-        valueText(&other, right, sizeof(right), "a comparison");
+        valueText(out, left, sizeof(left), "text compared");
+        valueText(&other, right, sizeof(right), "text compared");
         const int order = _stricmp(left, right);
         answer = compared(how, order == 0, order < 0, order > 0, order <= 0,
                           order >= 0);
@@ -5462,7 +7558,9 @@ static void expressionNot(ExpressionCursor* c, ExpressionValue* out) {
         expressionCompare(c, out);
         return;
     }
-    expressionNot(c, out);
+    valueFromNumber(out, 0.0);
+    if (enterLevel(c)) expressionNot(c, out);
+    --c->depth;
     if (!c->faulted) valueFromNumber(out, valueTruth(c, out) ? 0.0 : 1.0);
 }
 
@@ -5509,8 +7607,16 @@ static int textIsExpression(const char* text, int page) {
 
 static volatile LONG global_expressionFaultLines = 0;
 
+/* Set while makeSettingsFromModPages works the expressions out for the first
+   of its two times, and while workOutQuietly works one out, for the thread
+   doing so alone. While it is set, expressionLine writes and counts nothing,
+   evaluateWith writes and notes nothing about a value nested too deep, and
+   cutToRoom writes and notes nothing, on that thread. */
+static thread_local int global_quietExpressions = 0;
+
 /* A line about an expression, while fewer than 64 have been written. */
 static void expressionLine(const char* fmt, ...) {
+    if (global_quietExpressions) return;
     if (InterlockedIncrement(&global_expressionFaultLines) > 64) return;
     va_list ap;
     va_start(ap, fmt);
@@ -5523,6 +7629,17 @@ static const char* nameOfOwner(const OurSetting* owner) {
 }
 
 /*
+    The expressions that met a value nested deeper than EXPRESSION_DEPTH and
+    were still worked out, IFERROR answering in its place, each kept as
+    hashText of the expression's text so that each is logged once. Past
+    MAX_TOO_DEEP_TEXTS of them no more are logged.
+*/
+#define MAX_TOO_DEEP_TEXTS 64
+
+static uint64_t global_tooDeepText[MAX_TOO_DEEP_TEXTS];
+static int      global_tooDeepTextCount = 0;
+
+/*
     text      the expression, as the menupage wrote it
     owner     the control it was written on, or nothing
     option    what OPTION stands for, 0 for nothing
@@ -5533,7 +7650,9 @@ static const char* nameOfOwner(const OurSetting* owner) {
     readRoom  how many read has room for
 
     Answers 1 where it was worked out, 0 where it was not, which is written to
-    the log and is what IFERROR answers to.
+    the log and is what IFERROR answers to. An expression worked out with
+    IFERROR answering for a value nested too deep is written to the log too,
+    once. Nothing is written while global_quietExpressions is set.
 */
 static int evaluateWith(const char* text, const OurSetting* owner, int option,
                         const double* value, ExpressionValue* answer,
@@ -5550,6 +7669,7 @@ static int evaluateWith(const char* text, const OurSetting* owner, int option,
     c.scope = 0;
     c.scopeLimit = 0;
     c.depth = 0;
+    c.tooDeep = 0;
     c.faulted = 0;
     c.fault[0] = 0;
     c.readCount = 0;
@@ -5565,6 +7685,19 @@ static int evaluateWith(const char* text, const OurSetting* owner, int option,
         expressionLine("EXPRESSION \"%s\" on %s could not be worked out, %s",
                        text, nameOfOwner(owner), c.fault);
         return 0;
+    }
+    if (c.tooDeep && !global_quietExpressions) {
+        const uint64_t id = hashText(text);
+        int logged = 0;
+        for (int i = 0; i < global_tooDeepTextCount && !logged; ++i)
+            logged = global_tooDeepText[i] == id;
+        if (!logged && global_tooDeepTextCount < MAX_TOO_DEEP_TEXTS) {
+            global_tooDeepText[global_tooDeepTextCount++] = id;
+            writeLog("EXPRESSION \"%s\" on %s holds a value nested deeper "
+                     "than an expression may be, and IFERROR answered with "
+                     "its second value in its place", text,
+                     nameOfOwner(owner));
+        }
     }
     if (read && readCount) {
         int at = 0;
@@ -5588,7 +7721,7 @@ static int evaluateExpression(const char* text, const OurSetting* owner,
     ExpressionValue answer;
     if (!evaluateValue(text, owner, 0, &answer, read, readCount, readRoom))
         return 0;
-    valueText(&answer, out, room, "an expression answer");
+    valueText(&answer, out, room, "expression's answer");
     return 1;
 }
 
@@ -5688,6 +7821,143 @@ static int refreshLimits(OurSetting* s) {
 }
 
 /*
+    Two bytes for each setting of ours, indexed as global_ourSources is. Each
+    text has a bit of its own, and CUT_SHORT makes another of it four places
+    higher. A REFUSED_ bit is set the first time the text it stands for is
+    worked out to text the engine cannot draw, and the CUT_SHORT bit of a text
+    the first time that text is taken cut short to the room it has. A line is
+    written only then. A TEXT_ text is never refused, so only its CUT_SHORT
+    bit is ever set.
+*/
+#define REFUSED_TITLE        1
+#define REFUSED_DESCRIPTION  2
+#define REFUSED_LABEL        4    /* an option's label */
+#define REFUSED_VALUE_TEXT   8    /* a slider's SliderValueText */
+#define TEXT_KEY             256  /* the setting key */
+#define TEXT_DEFAULT         512  /* the default value */
+#define CUT_SHORT(refused)   ((refused) << 4)
+
+static unsigned short global_refusedTexts[MAX_FRAMEWORK_SOURCES];
+
+/* Whether bit of global_refusedTexts was not yet set for s, which it now is:
+   1 the first time it is asked for each control and bit, whichever threads
+   ask. */
+static int firstTimeNoted(const OurSetting* s, unsigned bit) {
+    const ptrdiff_t which = s - global_ourSources;
+    if (which < 0 || which >= MAX_FRAMEWORK_SOURCES) return 0;
+    const short before = InterlockedOr16(
+        (volatile short*)&global_refusedTexts[which], (short)bit);
+    return ((unsigned short)before & bit) == 0;
+}
+
+/*
+    worked, cut to the room bytes at out. The first time for each control and
+    text that it does not fit, a line says so, refused being the bit of
+    global_refusedTexts that stands for the text; while
+    global_quietExpressions is set, no line is written and nothing is noted.
+    what is what the line calls the text.
+*/
+static void cutToRoom(const OurSetting* s, char* out, size_t room,
+                      const char* worked, const char* what,
+                      unsigned refused) {
+    formatInto(out, room, "%.*s", (int)room - 1, worked);
+    const size_t length = strlen(worked);
+    if (length >= room && !global_quietExpressions
+        && firstTimeNoted(s, CUT_SHORT(refused)))
+        writeLog("EXPRESSION the %s of %s came to %u character(s) and there is "
+                 "room for %u, so it is cut short", what, nameOfOwner(s),
+                 (unsigned)length, (unsigned)(room - 1));
+}
+
+static int workOutQuietly(const OurSetting* s, const char* expression,
+                          int isKey, char* out, size_t room,
+                          const OurSetting** read, int* readCount,
+                          int readRoom) {
+    char worked[EXPRESSION_TEXT];
+    const int wasQuiet = global_quietExpressions;
+    global_quietExpressions = 1;
+    const int done = evaluateExpression(expression, s, worked, sizeof(worked),
+                                        read, readCount, readRoom);
+    global_quietExpressions = wasQuiet;
+    if (done)
+        cutToRoom(s, out, room, worked, isKey ? "setting key" : "default value",
+                  isKey ? TEXT_KEY : TEXT_DEFAULT);
+    return done;
+}
+
+/*
+    Where the first "<" of handed, the description of s as the engine is
+    handed it as markup, is that the engine cannot draw while s is locked, by
+    its own dependency or by its list's, or -1.
+*/
+static int fatalTagWhenLockedFor(const OurSetting* s, const char* handed) {
+    int at = -1;
+    if (s->dependency[0])
+        at = fatalTagWhenLockedAt(handed, s->dependencyDescription,
+                                  s->html || s->dependencyIsOurs);
+    if (at < 0 && s->gatingList >= 0 && s->gatingList < global_ourSourceCount) {
+        const OurSetting* list = &global_ourSources[s->gatingList];
+        at = fatalTagWhenLockedAt(handed, list->dependencyDescription,
+                                  list->html || list->dependencyIsOurs);
+    }
+    return at;
+}
+
+/*
+    s          the control the text was worked out for
+    field      its title or its description, which has room bytes
+    worked     what the expression came to
+    markup     1 where the engine is handed the text as it is written, 0 where
+               it is handed the text with "<", ">" and "&" written as entities
+    underLock  1 where, while s is locked, the engine draws the text the lock
+               adds after this one, as it does after a description
+    what       what the text is called in the log
+    refused    the bit of global_refusedTexts that stands for this text
+
+    The text, cut to room, goes into field only where the engine can draw it
+    as it is handed over, and where underLock is 1 and the text is markup,
+    also with the text a lock adds after it. Otherwise field keeps what it
+    held, and a line gives the text as it was handed the first time for each
+    control and each text. A text taken cut short is said to be so once in the
+    same way.
+*/
+static void takeWorkedText(OurSetting* s, char* field, size_t room,
+                           const char* worked, int markup, int underLock,
+                           const char* what, unsigned refused) {
+    char kept[EXPRESSION_TEXT];
+    const size_t keptRoom = room < sizeof(kept) ? room : sizeof(kept);
+    formatInto(kept, keptRoom, "%.*s", (int)keptRoom - 1, worked);
+    const char* handed = kept;
+    char escaped[MAX_SHOWN_TEXT];
+    if (!markup) {
+        escapeForMarkup(kept, escaped, sizeof(escaped));
+        handed = escaped;
+    }
+    const int drawn = fatalPipeAt(handed) < 0 && fatalTagAt(handed) < 0;
+    if (drawn
+        && (!markup || !underLock || fatalTagWhenLockedFor(s, handed) < 0)) {
+        cutToRoom(s, field, keptRoom, worked, what, refused);
+        return;
+    }
+    if (!firstTimeNoted(s, refused)) return;
+    const int entities = handed != kept && strcmp(handed, kept) != 0;
+    char measured[160];
+    formatInto(measured, sizeof(measured), "%s%s%s",
+               strlen(worked) >= keptRoom ? " once cut to the room it has" : "",
+               strlen(worked) >= keptRoom && entities ? " and" : "",
+               entities ? AS_ENTITIES : "");
+    const char* when = drawn ? " while the control is locked" : "";
+    if (field[0])
+        writeLog("EXPRESSION the %s of %s came to \"%s\"%s, which holds text "
+                 "the engine cannot draw%s, so the %s it had is kept", what,
+                 nameOfOwner(s), handed, measured, when, what);
+    else
+        writeLog("EXPRESSION the %s of %s came to \"%s\"%s, which holds text "
+                 "the engine cannot draw%s, so %s is shown with no %s", what,
+                 nameOfOwner(s), handed, measured, when, nameOfOwner(s), what);
+}
+
+/*
     The expressions a control carries, worked out again. Answers whether the
     setting it reads has changed, in which case its value is taken from the
     store again.
@@ -5696,36 +7966,46 @@ static int refreshLimits(OurSetting* s) {
     and what the engine matches the row on. Only what it reads, what it falls
     back to and what it says can follow another control.
 
-    withTexts 0 leaves the description and the title as they stand.
+    withTexts 0 leaves the description and the title as they stand. A
+    description or a title worked out to text the engine cannot draw is not
+    taken, and the one the control had stays.
 */
 static int refreshExpressions(OurSetting* s, int withTexts = 1) {
     if (!s) return 0;
     int keyChanged = 0;
     char worked[EXPRESSION_TEXT];
 
+    /* The key worked out is cut to the room for it, and compared with the key
+       held as it is kept. */
     if (s->keyExpression[0]
         && evaluateExpression(s->keyExpression, s, worked, sizeof(worked))
-        && worked[0] && _stricmp(s->storeKey, worked) != 0) {
-        copyBounded(s->storeKey, sizeof(s->storeKey), worked, "setting key");
-        keyChanged = 1;
+        && worked[0]) {
+        char key[sizeof(s->storeKey)];
+        cutToRoom(s, key, sizeof(key), worked, "setting key", TEXT_KEY);
+        if (_stricmp(s->storeKey, key) != 0) {
+            strcpy_s(s->storeKey, sizeof(s->storeKey), key);
+            keyChanged = 1;
+        }
     }
     if (s->defaultExpression[0]
         && evaluateExpression(s->defaultExpression, s, worked, sizeof(worked))) {
-        copyBounded(s->fallbackText, sizeof(s->fallbackText), worked,
-                    "default value");
+        cutToRoom(s, s->fallbackText, sizeof(s->fallbackText), worked,
+                  "default value", TEXT_DEFAULT);
         s->fallback = (float)atof(worked);
-        if (!s->touched)
-            copyBounded(s->shown, sizeof(s->shown), worked,
-                        "the value a row shows before it is used");
+        /* A slider whose store held a number outside its range keeps showing
+           that number until it is used. The two fields have the same room. */
+        if (!s->touched && !(s->mismatch && s->kind == KIND_SLIDER))
+            strcpy_s(s->shown, sizeof(s->shown), s->fallbackText);
     }
     if (withTexts && s->descriptionExpression[0]
         && evaluateExpression(s->descriptionExpression, s, worked,
                               sizeof(worked)))
-        copyBounded(s->description, sizeof(s->description), worked,
-                    "description");
+        takeWorkedText(s, s->description, sizeof(s->description), worked,
+                       s->html, 1, "description", REFUSED_DESCRIPTION);
     if (withTexts && s->titleExpression[0]
         && evaluateExpression(s->titleExpression, s, worked, sizeof(worked)))
-        copyBounded(s->title, sizeof(s->title), worked, "title");
+        takeWorkedText(s, s->title, sizeof(s->title), worked, 1, 0, "title",
+                       REFUSED_TITLE);
 
     if (keyChanged) {
         char held[MAX_SETTING_TEXT];
@@ -5746,7 +8026,9 @@ static int refreshExpressions(OurSetting* s, int withTexts = 1) {
 }
 
 /* The label of option at, worked out again where the menupage wrote it as an
-   expression. */
+   expression, and taken cut to the room an option has where the engine can
+   draw it so cut. A line says so the first time a label of the control is
+   refused, and the first time one is taken cut short. */
 static void refreshOptionLabel(OurSetting* s, int at) {
     if (!s || s->modItem < 0 || at < 0 || at >= MAX_OPTIONS) return;
     const ModPageItem* item = &global_modItems[s->modItem];
@@ -5757,22 +8039,30 @@ static void refreshOptionLabel(OurSetting* s, int at) {
     ExpressionValue answer;
     if (!text || !evaluateValue(text, s, at + 1, &answer, 0, 0, 0)) return;
     char worked[EXPRESSION_TEXT];
-    valueText(&answer, worked, sizeof(worked), "an option label");
-    if (fatalPipeAt(worked) >= 0 || fatalTagAt(worked) >= 0) {
-        expressionLine("EXPRESSION a label of %s came to \"%s\", which holds "
-                       "text the engine cannot draw, so it is not shown",
-                       s->name, worked);
+    valueText(&answer, worked, sizeof(worked), "option label");
+    /* Checked as it is shown: cut to the room an option has. */
+    char shown[sizeof(s->option[0])];
+    formatInto(shown, sizeof(shown), "%.*s", (int)sizeof(shown) - 1, worked);
+    if (fatalPipeAt(shown) >= 0 || fatalTagAt(shown) >= 0) {
+        if (firstTimeNoted(s, REFUSED_LABEL))
+            writeLog("EXPRESSION a label of %s came to \"%s\"%s, which holds "
+                     "text the engine cannot draw, so it is not shown", s->name,
+                     shown, strcmp(shown, worked) != 0
+                                ? " once cut to the room it has" : "");
         return;
     }
-    copyBounded(s->option[at], sizeof(s->option[at]), worked, "option");
+    cutToRoom(s, s->option[at], sizeof(s->option[at]), worked, "label",
+              REFUSED_LABEL);
 }
 
 /*
     The text a slider shows for its value where SliderValueText gives one: the
     expression worked out with VALUE standing for the value, so
     IF(VALUE > 30, "Persistent", VALUE) shows Persistent at 31 and the number
-    below it. Answers 0 where the slider has none, or it could not be worked
-    out or holds text the engine cannot draw, and the number is then shown.
+    below it, cut to room. Answers 0 where the slider has none, or it could not
+    be worked out, or cut to room it is empty or holds text the engine cannot
+    draw, and the number is then shown. A line says so the first time the
+    slider's text is refused, and the first time it is taken cut short.
 */
 static int sliderValueText(const OurSetting* s, char* out, size_t room) {
     if (!s || s->modItem < 0 || s->kind != KIND_SLIDER) return 0;
@@ -5783,14 +8073,21 @@ static int sliderValueText(const OurSetting* s, char* out, size_t room) {
     if (!evaluateWith(item->valueText, s, 0, &value, &answer, 0, 0, 0))
         return 0;
     char worked[EXPRESSION_TEXT];
-    valueText(&answer, worked, sizeof(worked), "a slider's value text");
-    if (!worked[0] || fatalPipeAt(worked) >= 0 || fatalTagAt(worked) >= 0) {
-        expressionLine("EXPRESSION the value text of %s came to \"%s\", which "
-                       "is empty or holds text the engine cannot draw, so the "
-                       "number is shown", s->name, worked);
+    valueText(&answer, worked, sizeof(worked), "slider's value text");
+    /* Checked as it is shown: cut to room. */
+    char shown[EXPRESSION_TEXT];
+    const size_t shownRoom = room < sizeof(shown) ? room : sizeof(shown);
+    formatInto(shown, shownRoom, "%.*s", (int)shownRoom - 1, worked);
+    if (!shown[0] || fatalPipeAt(shown) >= 0 || fatalTagAt(shown) >= 0) {
+        if (firstTimeNoted(s, REFUSED_VALUE_TEXT))
+            writeLog("EXPRESSION the value text of %s came to \"%s\"%s, which "
+                     "is empty or holds text the engine cannot draw, so the "
+                     "number is shown", s->name, shown,
+                     strcmp(shown, worked) != 0
+                         ? " once cut to the room it has" : "");
         return 0;
     }
-    copyBounded(out, room, worked, "a slider's value text");
+    cutToRoom(s, out, shownRoom, worked, "value text", REFUSED_VALUE_TEXT);
     return 1;
 }
 
@@ -5839,7 +8136,9 @@ static int settleLimits() {
             OurSetting* s = &global_ourSources[i];
             if (!hasRangeExpressions(s)) continue;
             refreshExpressions(s, 0);
-            if (s->locked != LOCKED_BY_NOTHING || !s->unsaved) continue;
+            if (s->locked != LOCKED_BY_NOTHING || !s->unsaved
+                || keyShownOnly(s))
+                continue;
 
             char now[MAX_SETTING_TEXT];
             if (s->kind == KIND_SLIDER) writeNumber(now, sizeof(now), s->value);
@@ -5850,7 +8149,7 @@ static int settleLimits() {
             keepText(s->storePath, s->storeSection, s->storeKey, now);
             s->unsaved = 0;
             s->rangeMoved = 1;
-            if (s->listOwner >= 0) composeList(s->listOwner);
+            composeList(listOf(s));
             ++moved;
         }
         written += moved;
@@ -5860,8 +8159,8 @@ static int settleLimits() {
 
 /*
     Every control whose visibility changed, drawn again so the engine asks
-    slot 20 and hides or shows its row. A row hidden while it has focus hands
-    focus on first.
+    the hidden slot and hides or shows its row. A row hidden while it has
+    focus hands focus on first.
 */
 static void settleVisibility() {
     for (int i = 0; i < global_ourSourceCount; ++i) {
@@ -5912,7 +8211,7 @@ static void settleAfterChange(const OurSetting* changing) {
             && s->index < s->optionCount && s->index < MAX_OPTIONS) {
             char was[MAX_SETTING_TEXT];
             copyBounded(was, sizeof(was), s->option[s->index],
-                        "an option label");
+                        "option label");
             refreshOptionLabel(s, s->index);
             redraw = strcmp(was, s->option[s->index]) != 0;
         }
@@ -5924,16 +8223,19 @@ static void settleAfterChange(const OurSetting* changing) {
 
 /*
     What a setting a preset names holds for the player now, into out: a
-    control's value, or while the control is locked the value it goes back to
-    when it unlocks; or the text of a settings file key no control reads.
-    Answers the control, or nothing.
+    control's value; or while the control is locked and has a value put aside
+    for it in Mod_Settings_Cache.ini, that value where it belongs to the lock,
+    and otherwise what its settings file holds where that holds a value; or
+    the text of a settings file key no control reads. A value an unlock left
+    in the cache is not read while the control is unlocked. Answers the
+    control, or nothing.
 */
 static OurSetting* presetHeld(const OurSetting* preset, const char* name,
                               char* out, size_t room) {
     char whole[MODPAGE_NAME * 2], section[MODPAGE_NAME];
-    copyBounded(whole, sizeof(whole), name, "a preset's setting");
+    copyBounded(whole, sizeof(whole), name, "setting name in a preset");
     const char* key = splitSettingName(whole, 1, preset, section,
-                                       sizeof(section), "a preset's section");
+                                       sizeof(section), "section in a preset");
     OurSetting* s = settingNamed(preset->storePath, section, key);
     out[0] = 0;
     if (!s) {
@@ -5941,15 +8243,18 @@ static OurSetting* presetHeld(const OurSetting* preset, const char* name,
         return 0;
     }
     if (s->locked != LOCKED_BY_NOTHING && global_settingsCachePath[0]) {
-        CacheNames names;
-        cacheNames(s, s->storeKey, &names);
-        storedText(global_settingsCachePath, names.section, names.storedKey, "",
-                   out, room);
-        if (out[0]) return s;
+        PutAside aside;
+        readPutAside(s, s->storeKey, s->fallbackText, &aside);
+        if (aside.stored[0] && (aside.belongs || aside.held[0])) {
+            copyBounded(out, room, aside.belongs ? aside.stored : aside.held,
+                        "value of a setting in a preset");
+            return s;
+        }
     }
     if (s->kind == KIND_SLIDER) writeNumber(out, room, s->value);
     else if (s->index >= 0 && s->index < s->optionCount)
-        copyBounded(out, room, s->optionValue[s->index], "a preset's setting");
+        copyBounded(out, room, s->optionValue[s->index],
+                    "value of a setting in a preset");
     else storedText(s->storePath, s->storeSection, s->storeKey, "", out, room);
     return s;
 }
@@ -5965,16 +8270,33 @@ static int presetValuesMatch(const char* held, const char* wanted) {
     return _stricmp(held, wanted) == 0;
 }
 
-/* Whether every setting preset p of s sets holds the preset's value. */
-static int presetHolds(const OurSetting* s, int p) {
-    const Preset* preset = &global_preset[global_modItems[s->modItem].firstPreset
-                                          + p];
+/* Whether every setting a preset of s sets holds the preset's value. */
+static int presetHoldsPreset(const OurSetting* s, const Preset* preset) {
     for (int k = 0; k < preset->count; ++k) {
         char held[MAX_SETTING_TEXT];
         presetHeld(s, preset->setting[k].name, held, sizeof(held));
         if (!presetValuesMatch(held, preset->setting[k].value)) return 0;
     }
     return 1;
+}
+
+/* Whether every setting preset p of s sets holds the preset's value. */
+static int presetHolds(const OurSetting* s, int p) {
+    return presetHoldsPreset(
+        s, &global_preset[global_modItems[s->modItem].firstPreset + p]);
+}
+
+/* s's Off preset, or 0 where it has none. */
+static const Preset* presetOff(const OurSetting* s) {
+    if (!s || s->modItem < 0) return 0;
+    const int off = global_modItems[s->modItem].offPreset;
+    return off > 0 ? &global_preset[off - 1] : 0;
+}
+
+/* Whether s has an Off preset and every setting it names holds its value. */
+static int presetOffHolds(const OurSetting* s) {
+    const Preset* off = presetOff(s);
+    return off && presetHoldsPreset(s, off);
 }
 
 /* The option a preset shows: the preset last chosen where it still holds,
@@ -6002,7 +8324,17 @@ static void presetFollow(OurSetting* s) {
     s->index = at;
     s->value = (float)at;
     s->asFloat = s->value;
-    copyBounded(s->shown, sizeof(s->shown), s->optionValue[at], "a preset");
+    copyBounded(s->shown, sizeof(s->shown), s->optionValue[at],
+                "value a preset shows");
+    /* The last option: Off's label while Off holds, else Custom's. */
+    const int last = s->optionCount - 1;
+    const Preset* off = presetOff(s);
+    if (off && last >= 0 && last < MAX_OPTIONS)
+        copyBounded(s->option[last], sizeof(s->option[last]),
+                    at == last && presetHoldsPreset(s, off)
+                        ? off->label
+                        : global_modItems[s->modItem].option[last].label,
+                    "label of a preset's last option");
 }
 
 /* The next setting of ours, empty, with nothing it belongs to. The caller
@@ -6021,19 +8353,23 @@ static OurSetting* newSetting() {
     like a toggle. Every method that would read a value is answered by us, and a
     button has none.
 */
-static int makeButtonSetting(const char* sourceName, const char* title) {
+static int makeButtonSetting(const char* sourceName, const char* title,
+                             const char* onPage, int entryRow) {
     if (!sourceName || !sourceName[0] || !title || !title[0]) return 0;
     if (global_ourSourceCount >= MAX_FRAMEWORK_SOURCES) {
-        writeLog("SETTING there is room for %d, so the button \"%s\" keeps its "
-                 "label in the text database", MAX_FRAMEWORK_SOURCES, title);
+        writeLog("SETTING there is room for %d, so the button \"%s\" on the "
+                 "page \"%s\" keeps its label in the text database",
+                 MAX_FRAMEWORK_SOURCES, title, onPage);
         return 0;
     }
     OurSetting* s = newSetting();
     s->kind = KIND_BUTTON;
+    s->entryRow = entryRow;
     s->modItem = -1;
     s->optionCount = 1;
     copyBounded(s->name, sizeof(s->name), sourceName, "button source name");
     copyBounded(s->title, sizeof(s->title), title, "button title");
+    copyBounded(s->onPage, sizeof(s->onPage), onPage, "page heading");
     strcpy_s(s->className, sizeof(s->className), SELECTOR_CLASS);
     s->id = hashText(s->name);
     s->classId = hashText(s->className);
@@ -6053,25 +8389,29 @@ static void textOrExpression(const char* text, int page, char* plain,
 }
 
 /*
-    Every control a menupage describes becomes a setting. A value the store
-    holds that the control cannot represent is left alone and reported: the row
-    shows its default until it is used, and only then is the store written.
+    Every control a menupage describes becomes a setting, but for a block that
+    was skipped or is inside a block that was. A value the store holds that
+    the control cannot represent is left alone and reported: a slider shows
+    the number as it stands, any other control its default as it stood when
+    the store was read, until it is used, and only then is the store
+    written.
 */
 static void makeSettingsFromModPages() {
     for (int p = 0; p < global_modPageCount; ++p) {
         const ModPage* page = &global_modPages[p];
         for (int i = page->firstItem; i < page->firstItem + page->itemCount; ++i) {
             const ModPageItem* item = &global_modItems[i];
-            if (item->refused || item->itemType == ITEM_SUBMENU
+            if (blockIsSkipped(i) || item->itemType == ITEM_SUBMENU
                 || item->itemType == ITEM_PAGELINK) continue;
             if (global_ourSourceCount >= MAX_FRAMEWORK_SOURCES) {
                 writeLog("SETTING there is room for %d, so \"%s\" was left out",
                          MAX_FRAMEWORK_SOURCES, item->settingName);
+                global_reachUnknown = 1;
                 break;
             }
             OurSetting* s = newSetting();
             copyBounded(s->keyExpression, sizeof(s->keyExpression),
-                        item->settingKey, "a setting key expression");
+                        item->settingKey, "setting key expression");
             s->index = -1;
             s->modItem = i;
             s->html = item->html != 0;
@@ -6079,7 +8419,7 @@ static void makeSettingsFromModPages() {
             copyBounded(s->name, sizeof(s->name), item->settingName, "setting name");
             textOrExpression(item->title, p, s->title, sizeof(s->title), "title",
                              s->titleExpression, sizeof(s->titleExpression),
-                             "a title expression");
+                             "title expression");
             copyBounded(s->storeKey, sizeof(s->storeKey), item->settingName, "key");
             copyBounded(s->storeSection, sizeof(s->storeSection), item->section,
                         "section");
@@ -6089,47 +8429,30 @@ static void makeSettingsFromModPages() {
                              sizeof(s->description), "description",
                              s->descriptionExpression,
                              sizeof(s->descriptionExpression),
-                             "a description expression");
+                             "description expression");
             copyBounded(s->dependency, sizeof(s->dependency), item->dependency,
                         "dependency");
             /* A dependency with no wording of its own is written out as it
-               stands, after the sentence that says what it is. */
-            if (item->dependencyDescription[0])
-                copyBounded(s->dependencyDescription,
-                            sizeof(s->dependencyDescription),
-                            item->dependencyDescription,
-                            "dependency description");
-            else if (item->dependency[0]) {
-                /* The condition may hold "<", ">" and "&", which must reach the
-                   markup as entities. */
-                char safe[MODPAGE_DEPENDENCY * 5 + 1];
-                char made[sizeof(safe) + 64];
-                escapeForMarkup(item->dependency, safe, sizeof(safe));
-                sprintf_s(made, "To modify this setting, <b>%s</b>.", safe);
-                copyBounded(s->dependencyDescription,
-                            sizeof(s->dependencyDescription), made,
-                            "dependency description");
-                s->dependencyIsOurs = 1;
-            }
-            /* A "|" that no second "|" closes within 63 characters ends the
-               process when the engine draws it. */
-            if (fatalPipeAt(s->dependencyDescription) >= 0
-                || ((s->html || s->dependencyIsOurs)
-                    && fatalTagAt(s->dependencyDescription) >= 0)) {
+               stands, after the sentence that says what it is. The text,
+               shown only while the dependency does not hold, is checked only
+               where there is a dependency. */
+            dependencyTextOf(item, s->dependencyDescription,
+                             sizeof(s->dependencyDescription),
+                             &s->dependencyIsOurs);
+            if (s->dependency[0]
+                && !dependencyTextIsSafe(s->dependencyDescription,
+                                         s->html || s->dependencyIsOurs)) {
                 writeLog("MODPAGE \"%s\" would show \"%s\" while it is locked, "
                          "which holds text the engine cannot draw, so it shows "
                          "nothing instead", s->name, s->dependencyDescription);
                 s->dependencyDescription[0] = 0;
             }
-            char textKey[MAX_SOURCE_TEXT + 24];
-            sprintf_s(textKey, "%s.dependency", s->name);
-            s->dependencyDescriptionKeyId = hashText(textKey);
             copyBounded(s->listValue, sizeof(s->listValue), item->listValue,
                         "list value");
             textOrExpression(item->fallback, p, s->fallbackText,
                              sizeof(s->fallbackText), "default value",
                              s->defaultExpression, sizeof(s->defaultExpression),
-                             "a default value expression");
+                             "default value expression");
             s->markAsModified = item->markAsModified;
 
             if (item->itemType == ITEM_LIST) {
@@ -6181,7 +8504,9 @@ static void makeSettingsFromModPages() {
                 s->optionCount = s->optionCapacity;
             }
             /* A keybind offers one option, which no row draws: what the engine
-               asks of a selector is answered without it. */
+               asks of a selector is answered without it. A row that only
+               shows the key (keyShownOnly) shows the key's name in its
+               place. */
             if (s->kind == KIND_KEYBIND) {
                 s->optionCount = s->optionCapacity = 1;
                 strcpy_s(s->option[0], sizeof(s->option[0]), "Key");
@@ -6197,10 +8522,11 @@ static void makeSettingsFromModPages() {
                refreshExpressions fills both in afterwards. */
             s->fallback = (float)atof(s->fallbackText);
             copyBounded(s->shown, sizeof(s->shown), s->fallbackText,
-                        "the value a row shows before it is used");
+                        "value a row shows before it is used");
 
             s->id      = hashText(s->name);
             s->classId = hashText(s->className);
+            char textKey[MAX_SOURCE_TEXT + 24];
             sprintf_s(textKey, "%s.description", s->name);
             s->descriptionKeyId = hashText(textKey);
             sprintf_s(textKey, "%s.title", s->name);
@@ -6219,9 +8545,7 @@ static void makeSettingsFromModPages() {
         const int mine = global_ourSources[i].modItem;
         if (mine < 0) continue;
         const int owner = global_modItems[mine].parent;
-        int gating = owner;
-        if (gating >= 0 && global_modItems[gating].itemType == ITEM_LIST_CONTROL)
-            gating = global_modItems[gating].parent;
+        const int gating = gatingBlockOf(mine);
         for (int k = 0; k < global_ourSourceCount; ++k) {
             const OurSetting* other = &global_ourSources[k];
             if (other->kind != KIND_LIST) {
@@ -6237,19 +8561,71 @@ static void makeSettingsFromModPages() {
         }
     }
 
-    /* What the store already holds, and whether the control can show it. The
-       expressions come first: one of them decides which key that is. */
-    for (int i = 0; i < global_ourSourceCount; ++i)
-        refreshExpressions(&global_ourSources[i]);
-
+    /*
+        A description written as text was checked when its page was read, but
+        not as it is once a block has taken what it inherits: the description
+        itself, whether it is markup, and the dependencies whose text a lock
+        draws after it. Each is checked again as the engine is handed it, and
+        one the engine cannot draw is emptied. The text with its "<", ">" and
+        "&" written as entities is kept on the heap, off the stack the
+        expressions worked out below take.
+    */
+    char* escaped = (char*)malloc(MAX_SHOWN_TEXT);
     for (int i = 0; i < global_ourSourceCount; ++i) {
         OurSetting* s = &global_ourSources[i];
-        if (!holdsValue(s)) continue;
-        char held[MAX_SETTING_TEXT];
-        storedText(s->storePath, s->storeSection, s->storeKey, "", held,
-                   sizeof(held));
-        takeValue(s, held, 1);
+        if (s->modItem < 0 || s->kind == KIND_LIST || !s->description[0]
+            || s->descriptionExpression[0])
+            continue;
+        const char* handed = s->description;
+        if (!s->html) {
+            if (!escaped) continue;
+            escapeForMarkup(s->description, escaped, MAX_SHOWN_TEXT);
+            handed = escaped;
+        }
+        const int drawn = fatalPipeAt(handed) < 0 && fatalTagAt(handed) < 0;
+        if (drawn && (!s->html || fatalTagWhenLockedFor(s, handed) < 0))
+            continue;
+        const char* measured = handed != s->description
+                               && strcmp(handed, s->description) != 0
+                             ? AS_ENTITIES : "";
+        writeLog("MODPAGE %s: the description of %s, with what it inherits, "
+                 "is \"%s\"%s, which holds text the engine cannot draw%s, so "
+                 "%s is shown with no description",
+                 global_modPages[global_modItems[s->modItem].file].name,
+                 s->name, handed, measured,
+                 drawn ? " while the control is locked" : "", s->name);
+        s->description[0] = 0;
     }
+    free(escaped);
+
+    /*
+        What the store already holds, and whether the control can show it. The
+        expressions other than the title and the description come first: one
+        of them decides which key that is. They are worked out without a line,
+        and every value is taken without a line. Then every expression, the
+        title and the description among them, is worked out from the values
+        taken, since any of them may name another control, with a line for
+        each that fails, and only then is every value taken again and one the
+        control cannot show reported.
+    */
+    for (int complain = 0; complain < 2; ++complain) {
+        global_quietExpressions = !complain;
+        for (int i = 0; i < global_ourSourceCount; ++i)
+            refreshExpressions(&global_ourSources[i], complain);
+        global_quietExpressions = 0;
+        for (int i = 0; i < global_ourSourceCount; ++i) {
+            OurSetting* s = &global_ourSources[i];
+            if (!holdsValue(s)) continue;
+            char held[MAX_SETTING_TEXT];
+            storedText(s->storePath, s->storeSection, s->storeKey, "", held,
+                       sizeof(held));
+            takeValue(s, held, complain);
+        }
+    }
+    for (int p = 0; p < global_modPageCount; ++p)
+        noteNewSettingsFile(global_modPages[p].storePath);
+    forgetUnreachedPutAside();
+    forgetPutAsideOfNewFiles();
     applyEveryLockState();
 }
 
@@ -6267,11 +8643,31 @@ typedef uint64_t (*CreateDataSourceFn)(void* manager, uint64_t classId,
 /* The loader's trampoline for CreateDataSource. */
 static uint64_t global_createDataSource = 0;
 
+/* Whether a setting of ours wants a data source made: one with a name and a
+   class whose row a page draws. */
+static int wantsSource(const OurSetting* s) {
+    return s->id && s->classId && !s->onNoPage;
+}
+
+/* How many settings of ours want a data source made. */
+static int settingsWantingSources() {
+    int wanting = 0;
+    for (int i = 0; i < global_ourSourceCount; ++i)
+        if (wantsSource(&global_ourSources[i])) ++wanting;
+    return wanting;
+}
+
 /*
     Built from inside CreateDataSource, through the loader's trampoline, where
     the engine memory scope the allocation needs is live. manager is the one
     CreateDataSource was called with. Once each, and a failure of one does not
-    stop the rest.
+    stop the rest. Where maxFrameworkSources has room for every one they are
+    made in the order of global_ourSources. Where it has not, the row on a
+    page of the game that opens the landing page is made first, then the
+    other buttons that open pages, from the last to the first, so that the
+    buttons of the landing page come next; then the other settings, in order,
+    so that those left out are the last controls. A line names a button by
+    its title and the page it is on, and any other setting by its name.
 */
 static void makeOurSettings(uint64_t manager) {
     if (!manager) return;
@@ -6283,15 +8679,32 @@ static void makeOurSettings(uint64_t manager) {
         return;
     }
 
-    int tried = 0;
-    for (int i = 0; i < global_ourSourceCount; ++i) {
-        OurSetting* s = &global_ourSources[i];
-        if (!s->id || !s->classId) continue;
+    int tried = 0, leftOut = 0;
+    char named[MAX_SETTING_TEXT * 2 + 32], firstLeftOut[sizeof(named)] = "";
+    /* Where some are left out, n goes through the settings three times:
+       forwards making the rows that open the landing page from a page of the
+       game, backwards making the other buttons, then forwards making the
+       rest. */
+    const int count = global_ourSourceCount;
+    const int passes = settingsWantingSources() > global_maxFrameworkSources
+                     ? 3 : 1;
+    for (int n = 0; n < passes * count; ++n) {
+        const int pass = passes == 1 ? 2 : n / count;
+        OurSetting* s =
+            &global_ourSources[pass == 1 ? count - 1 - n % count : n % count];
+        const int button = s->kind == KIND_BUTTON;
+        if (!wantsSource(s)
+            || (passes > 1 && (pass == 0 ? !button || !s->entryRow
+                               : pass == 1 ? !button || s->entryRow
+                                           : button)))
+            continue;
+        if (button)
+            formatInto(named, sizeof(named), "the button \"%s\" on the page "
+                       "\"%s\"", s->title, s->onPage);
+        else formatInto(named, sizeof(named), "\"%s\"", s->name);
         if (tried >= global_maxFrameworkSources) {
-            writeLog("SETTING \"%s\" was not made: %d is as many as "
-                     "maxFrameworkSources allows, and the pool the engine "
-                     "keeps them in has no room to spare", s->name,
-                     global_maxFrameworkSources);
+            if (!leftOut) strcpy_s(firstLeftOut, sizeof(firstLeftOut), named);
+            ++leftOut;
             continue;
         }
         ++tried;
@@ -6309,10 +8722,16 @@ static void makeOurSettings(uint64_t manager) {
 
         s->object = made;
         if (made) readQword(made, &s->vtable);
-        else writeLog("SETTING \"%s\" was not made as %s: %s", s->name,
+        else writeLog("SETTING %s was not made as %s: %s", named,
                       s->className, ok ? "nothing was returned"
                                        : "it faulted");
     }
+    /* Where the limit was lowered for the pool, a POOL line has said this. */
+    if (leftOut && !global_poolLimitedSettings)
+        writeLog("SETTING %d setting(s) of ours, %s the first of them, were not "
+                 "made, as maxFrameworkSources allows no more than %d: their "
+                 "rows show the text their widgets were authored with",
+                 leftOut, firstLeftOut, global_maxFrameworkSources);
     giveOurSettingsOwnVtable();
 }
 
@@ -6322,7 +8741,7 @@ static void makeOurSettings(uint64_t manager) {
     when every bit is set its allocator answers nothing and the insert writes
     through that answer, which ends the process.
 
-    The pool descriptor, at the rva below:
+    The pool descriptor, at the build's sourcePool:
 
         +0x00  void*  the node memory
         +0x08  void*  the bitmap allocation, kept only so it can be freed
@@ -6336,14 +8755,14 @@ static void makeOurSettings(uint64_t manager) {
         +0x48  u64    the alignment
         +0x50  u64    the last index handed out
 
-    Nodes are 32 bytes and the pool holds 541. The map chains, and with a larger
-    pool the bucket array stays as it is and the chains get longer.
+    Nodes are 32 bytes, and the pool holds 541 in Part I and 809 in Part II.
+    The map chains, and with a larger pool the bucket array stays as it is and
+    the chains get longer.
 
     The block and the bitmap are replaced, not extended, and this may only be
     done while the pool is empty. +0x08 is left pointing at the engine's own
     bitmap.
 */
-#define SOURCE_POOL_RVA        0x0368BBC8ull
 #define SOURCE_POOL_MEMORY     0x00
 #define SOURCE_POOL_BITS       0x10
 #define SOURCE_POOL_BITCOUNT   0x18
@@ -6360,13 +8779,67 @@ static void makeOurSettings(uint64_t manager) {
 
 /* Nodes to add to the pool. 0 leaves the engine's pool alone. */
 static int  global_extraSourceSlots = 0;
-static LONG global_poolEnlarged = 0;
+/* Set by the first call of enlargeDataSourcePool, which settles the pool and
+   how many settings of ours it has room for. */
+static LONG global_poolSettled = 0;
 
+/*
+    Lowers maxFrameworkSources to what the data source pool has room for, where
+    it allows more: the build's safeFrameworkSources and the nodes added, which
+    are none where the pool was left as the engine made it. why says what
+    became of the pool, and is logged with how many settings are made where
+    some are left out.
+*/
+static void limitOurSettings(int added, const char* why) {
+    const int room = added + global_game->safeFrameworkSources;
+    if (room >= global_maxFrameworkSources) return;
+    global_maxFrameworkSources = room;
+    global_poolLimitedSettings = 1;
+    const int wanting = settingsWantingSources();
+    if (wanting > room)
+        writeLog("POOL %s, so no more than %d of the %d settings of ours will "
+                 "be made, and the rows of the other %d show the text their "
+                 "widgets were authored with", why, room, wanting,
+                 wanting - room);
+}
+
+/*
+    The pool is left as the engine made it, for reason. In a build with a
+    safe number of settings (Part I), line, where there is one, is logged, and
+    the settings of ours are limited to that number (limitOurSettings, with
+    limit as its why). In a build without one (Part II), no setting of ours
+    is made, and where any wants a data source one line says why.
+*/
+static void leavePoolAlone(const char* reason, const char* line,
+                           const char* limit) {
+    if (global_game->safeFrameworkSources > 0) {
+        if (line) writeLog("POOL %s", line);
+        limitOurSettings(0, limit);
+        return;
+    }
+    global_maxFrameworkSources = 0;
+    global_poolLimitedSettings = 1;
+    if (settingsWantingSources() > 0)
+        writeLog("POOL in Part II the data source pool must be enlarged and it "
+                 "was not (%s), so none of the framework's settings are made",
+                 reason);
+}
+
+/* Runs once, from the first CreateDataSource and before any setting of ours
+   is made. Enlarges the pool by extraSourceSlots where it can, and settles how
+   many settings of ours are made. */
 static void enlargeDataSourcePool() {
-    if (global_extraSourceSlots <= 0) return;
-    if (InterlockedCompareExchange(&global_poolEnlarged, 1, 0) != 0) return;
+    if (!global_game) return;
+    if (InterlockedCompareExchange(&global_poolSettled, 1, 0) != 0) return;
+    static const char* const leftAlone = "the data source pool was left alone";
+    if (global_extraSourceSlots <= 0) {
+        leavePoolAlone("extraSourceSlots is 0", nullptr,
+                       "extraSourceSlots is 0, which leaves the data source "
+                       "pool as the engine made it");
+        return;
+    }
 
-    const uint64_t pool = global_moduleBase + SOURCE_POOL_RVA;
+    const uint64_t pool = global_moduleBase + global_game->sourcePool;
     uint64_t memory = 0, bits = 0, count = 0, stride = 0, live = 0, align = 0;
     if (!readQword(pool + SOURCE_POOL_MEMORY, &memory)
         || !readQword(pool + SOURCE_POOL_BITS, &bits)
@@ -6374,21 +8847,30 @@ static void enlargeDataSourcePool() {
         || !readQword(pool + SOURCE_POOL_STRIDE, &stride)
         || !readQword(pool + SOURCE_POOL_LIVE, &live)
         || !readQword(pool + SOURCE_POOL_ALIGN, &align)) {
-        writeLog("POOL the data source pool at rva %08llX could not be read, so "
-                 "it was left alone", (unsigned long long)SOURCE_POOL_RVA);
+        leavePoolAlone("it could not be read",
+                       "the data source pool could not be read, so it was "
+                       "left alone", leftAlone);
         return;
     }
+    char line[160], reason[96];
     if (stride != SOURCE_POOL_NODE_BYTES || align != SOURCE_POOL_ALIGNMENT
         || !memory || !bits || !count) {
-        writeLog("POOL that is not the shape this build expects, %d bytes a "
-                 "node aligned to %d, so the pool was left alone",
-                 SOURCE_POOL_NODE_BYTES, SOURCE_POOL_ALIGNMENT);
+        formatInto(line, sizeof(line), "that is not the shape this build "
+                   "expects, %d bytes a node aligned to %d, so the pool was "
+                   "left alone", SOURCE_POOL_NODE_BYTES, SOURCE_POOL_ALIGNMENT);
+        formatInto(reason, sizeof(reason), "it is not the shape the framework "
+                   "expects, %d bytes a node aligned to %d",
+                   SOURCE_POOL_NODE_BYTES, SOURCE_POOL_ALIGNMENT);
+        leavePoolAlone(reason, line, leftAlone);
         return;
     }
     if (live != 0) {
-        writeLog("POOL %llu node(s) are already in use, and the block cannot be "
-                 "moved with anything in it, so the pool was left alone",
-                 (unsigned long long)live);
+        formatInto(line, sizeof(line), "%llu node(s) are already in use, and "
+                   "the block cannot be moved with anything in it, so the pool "
+                   "was left alone", (unsigned long long)live);
+        formatInto(reason, sizeof(reason), "%llu node(s) were already in use",
+                   (unsigned long long)live);
+        leavePoolAlone(reason, line, leftAlone);
         return;
     }
 
@@ -6401,8 +8883,11 @@ static void enlargeDataSourcePool() {
     if (!block || !bitmap) {
         if (block)  VirtualFree(block, 0, MEM_RELEASE);
         if (bitmap) VirtualFree(bitmap, 0, MEM_RELEASE);
-        writeLog("POOL there was no memory for %llu node(s), so the pool was "
-                 "left alone", (unsigned long long)wanted);
+        formatInto(line, sizeof(line), "there was no memory for %llu node(s), "
+                   "so the pool was left alone", (unsigned long long)wanted);
+        formatInto(reason, sizeof(reason), "there was no memory for %llu "
+                   "node(s)", (unsigned long long)wanted);
+        leavePoolAlone(reason, line, leftAlone);
         return;
     }
 
@@ -6423,7 +8908,16 @@ static void enlargeDataSourcePool() {
         writeLog("POOL the descriptor could not be written, so the pool may be "
                  "in a half changed state and no source of ours will be made");
         global_maxFrameworkSources = 0;
+        global_poolLimitedSettings = 1;
+        return;
     }
+    /* The pool now counts wanted nodes, and the allocator hands out none past
+       that count. */
+    const int added = (int)(wanted - count);
+    char why[80];
+    formatInto(why, sizeof(why), "the data source pool was given %d more "
+               "node(s)", added);
+    limitOurSettings(added, why);
 }
 
 static void createDataSourceHook(void* registers, void*) {
@@ -6443,15 +8937,24 @@ static void createDataSourceHook(void* registers, void*) {
 
 /*
     The slots ours answers. Eleven is the value setter. One and nine are the
-    pair that decides what a row shows.
+    pair that decides what a row shows. These and AT_DEFAULT_SLOT are the same
+    in every build. The others are the build's, Part I's and Part II's:
+
+        hiddenSlot            20  21
+        availabilitySlot      21  22
+        labelSlot             24  25   GetLabelTextId
+        descriptionSlot       25  26   GetDescriptionTextId
+        dependencyTextSlot    26  27   GetDependencyDescriptionId
+        valueRangeSlot        28  29
+        valuePointerSlot      30  31   a slider's GetValue, a selector's
+                                       GetValuePtr
+
+    Part II has one slot more, at 16, so every slot from Part I's 16 up is one
+    higher there. The slot numbers and addresses below are Part I's.
 */
 #define SET_ITEM_VALUE_SLOT  11
 #define FIELD_CONFIG_SLOT     1
 #define OUR_ITEM_DATA_SLOT    9
-#define LABEL_SLOT           24
-#define DESCRIPTION_SLOT     25
-#define VALUE_RANGE_SLOT     28
-#define VALUE_POINTER_SLOT   30
 
 /*
     How the engine locks a setting of its own.
@@ -6481,18 +8984,13 @@ static void createDataSourceHook(void* registers, void*) {
     +0x4D8 which asks slot 25, and the dependency description, from +0x4E0 which
     asks slot 26. So one number drives the padlock, the refusal and the red text
     together, and slot 26 supplies the wording.
-*/
-#define AVAILABILITY_SLOT    21
-#define DEPENDENCY_TEXT_SLOT 26
 
-/*
     Slot 20 answers whether a row is hidden. PopulateComponentFromItem asks it
     on every refresh, straight after slot 21, and hands the answer to 02664F34,
     which keeps it on the component: a component it says is hidden is not
     drawn, is left out of its container's layout so the rows below close up,
     cannot take focus, and is passed over by the page's reset check.
 */
-#define HIDDEN_SLOT          20
 
 /*
     Slot 13 answers whether a control is at its default.
@@ -6617,156 +9115,249 @@ static uint64_t global_percentId     = 0;
    intervals in the range. */
 #define BAR_INTERVALS_ID 0xfaffc910bc555e6bull
 
-/*
-    TextDbCache::Add(cache, key, text, flag, flag). The cache is looked in
-    before the table the game loaded from disk, so text put here is found first.
-    It is a ring of thirty-two entries, and what is put here ages out.
-*/
-typedef const char* (*AddTextFn)(uint64_t cache, uint64_t key, const char* text,
-                                 uint8_t flagOne, uint8_t flagTwo);
-
-static uint64_t global_addText   = 0;
-static uint64_t global_textCache = 0;
+/* ------------------------------------------- the framework's own texts */
 
 /*
-    The cache, read out of TextDbCache::Add at rva 0048CB70:
+    The texts the framework hands the game by id: a control's description,
+    the reason a control is greyed out, and a button's label. Each is kept
+    under its id in a store of the framework's own, and the game's text
+    lookup is answered from the store where the lookup found nothing
+    (textAnswered).
 
-        +0x000  int       which entry Add writes next
-        +0x004  int       the next free byte in the text pool
-        +0x008  entry[32] sixteen bytes each, the id then a four byte offset
-                          into the pool, so the entry array ends at +0x208
-        +0x208  int       a bit per entry
-        +0x20C  int       a bit per entry
-        +0x210  char*     the text pool, one allocation
-        +0x218  int       how many bytes the pool holds
+    global_textArena    TEXT_STORE_BYTES, filled from the front. A text is
+                        copied in whole with its terminator and is never
+                        changed or freed, so a pointer to it that the game
+                        holds stays valid while the game runs.
+    global_storedText   TEXT_STORE_SLOTS slots, which must be a power of two,
+                        each an id and the text it is answered with. An id
+                        is looked for from the slot id & (TEXT_STORE_SLOTS
+                        - 1) onwards, one slot at a time, until it or an
+                        empty slot (id 0) is found. At most TEXT_STORE_MOST
+                        ids are held, so a search always meets an empty
+                        slot.
 
-    Add copies the text into the pool and advances +0x004 past the terminator.
-    When the next string will not fit it sets the offset back to zero and clears
-    every entry, so a pointer the engine still holds into the pool is not
-    protected.
-
-    The pool's address and its size are both fields. The entry index is
-    advanced as (index + 1) modulo 32 with the 32 written into the instruction,
-    and the two bit fields are one word each, so the ring is thirty-two entries
-    whatever the pool is. A larger pool stops every entry being dropped at once;
-    the thirty-third string written since a text was cached still takes that
-    text's entry.
+    storeText writes only while it holds global_textStoreLock exclusively.
+    textOfId takes no lock: a slot's text is written before its id, and a
+    text is replaced by swapping the pointer whole, so a reader that finds an
+    id finds a whole text.
 */
-#define TEXT_CACHE_INDEX      0x000
-#define TEXT_CACHE_OFFSET     0x004
-#define TEXT_CACHE_FLAGS_ONE  0x208
-#define TEXT_CACHE_FLAGS_TWO  0x20C
-#define TEXT_CACHE_POOL       0x210
-#define TEXT_CACHE_CAPACITY   0x218
-#define TEXT_CACHE_ENTRIES    0x008
-#define TEXT_CACHE_ENTRY_SIZE 0x010
-#define TEXT_CACHE_ENTRY_MAX  32
+#define TEXT_STORE_BYTES  (10u * 1024u * 1024u)
+#define TEXT_STORE_SLOTS  16384
+#define TEXT_STORE_MOST   (TEXT_STORE_SLOTS / 4 * 3)
 
-/* Megabytes the pool is given. */
-#define TEXT_POOL_MEGABYTES 10
+struct StoredText {
+    volatile uint64_t    id;
+    const char* volatile text;
+};
 
-/*
-    A pool of our own for the cache. The block is replaced, not extended, and
-    the entries are cleared with it: each one holds an offset into the old
-    pool. The engine's own block is left allocated.
-*/
-static LONG global_textPoolGiven = 0;
+static StoredText global_storedText[TEXT_STORE_SLOTS];
+static int        global_storedTextCount = 0;
+static char*      global_textArena = nullptr;
+static size_t     global_textArenaUsed = 0;
+/* The store had no room for a text: it keeps nothing more, and the line
+   saying so has been written. */
+static int        global_textStoreFull = 0;
+static SRWLOCK    global_textStoreLock = SRWLOCK_INIT;
 
-static void enlargeTextPool() {
-    if (!global_textCache) return;
-    if (InterlockedCompareExchange(&global_textPoolGiven, 1, 0) != 0) return;
+/* The arena, made once, before any text is stored. Where there is no memory
+   for it a line says so, and no text is stored. */
+static void openTextStore() {
+    if (global_textArena) return;
+    global_textArena = (char*)VirtualAlloc(nullptr, TEXT_STORE_BYTES,
+                                           MEM_COMMIT | MEM_RESERVE,
+                                           PAGE_READWRITE);
+    if (!global_textArena)
+        writeLog("TEXT there was no memory for the framework's store of texts "
+                 "(%u megabytes), so descriptions, the reasons controls are "
+                 "greyed out, and the labels of buttons that have no setting "
+                 "of their own are not shown",
+                 TEXT_STORE_BYTES / (1024u * 1024u));
+}
 
-    uint64_t pool = 0;
-    uint32_t capacity = 0;
-    if (!readQword(global_textCache + TEXT_CACHE_POOL, &pool)
-        || !readDword(global_textCache + TEXT_CACHE_CAPACITY, &capacity)
-        || !pool || (int)capacity <= 0) {
-        writeLog("TEXT the cache at %016llx could not be read, so its pool was "
-                 "left alone", (unsigned long long)global_textCache);
-        return;
+/* The text the store answers id with, or nullptr. */
+static const char* textOfId(uint64_t id) {
+    if (!id) return nullptr;
+    for (uint64_t probe = 0; probe < TEXT_STORE_SLOTS; ++probe) {
+        const StoredText* slot =
+            &global_storedText[(id + probe) & (TEXT_STORE_SLOTS - 1)];
+        const uint64_t held = slot->id;
+        if (held == id) return slot->text;
+        if (!held) return nullptr;
     }
-
-    const size_t wanted = (size_t)TEXT_POOL_MEGABYTES * 1024u * 1024u;
-    void* block = VirtualAlloc(nullptr, wanted, MEM_COMMIT | MEM_RESERVE,
-                               PAGE_READWRITE);
-    if (!block) {
-        writeLog("TEXT there was no memory for a pool of %d megabyte(s), so "
-                 "the engine's %d byte pool was left alone",
-                 TEXT_POOL_MEGABYTES, (int)capacity);
-        return;
-    }
-
-    int ok = 0;
-    GUARD_TRY {
-        *(uint64_t*)(global_textCache + TEXT_CACHE_POOL) = (uint64_t)block;
-        *(int*)(global_textCache + TEXT_CACHE_CAPACITY) = (int)wanted;
-        *(int*)(global_textCache + TEXT_CACHE_OFFSET) = 0;
-        *(int*)(global_textCache + TEXT_CACHE_INDEX) = 0;
-        *(int*)(global_textCache + TEXT_CACHE_FLAGS_ONE) = 0;
-        *(int*)(global_textCache + TEXT_CACHE_FLAGS_TWO) = 0;
-        for (int i = 0; i < TEXT_CACHE_ENTRY_MAX; ++i)
-            *(uint64_t*)(global_textCache + TEXT_CACHE_ENTRIES
-                         + (uint64_t)i * TEXT_CACHE_ENTRY_SIZE) = 0;
-        ok = 1;
-    } GUARD_EXCEPT_DESCRIBING("giving the text cache a larger pool") { ok = 0; }
-
-    if (!ok)
-        writeLog("TEXT the cache could not be written, so it may be in a half "
-                 "changed state");
+    return nullptr;
 }
 
 /*
-    Whether the cache already answers keyId with this text.
-
-    The entries are thirty-two sixteen byte pairs from +0x008: the id, then a
-    four byte offset into the pool. A reset zeroes every id, so an entry whose
-    id still matches is a live one.
+    text kept under id. An id the store holds with another text is given this
+    one. Answers 1 where the store now answers id with text, and 0 where it
+    cannot: id is 0, there is no arena, or the store is full. The store is
+    full from the first text there is no room for in the arena or the table,
+    which one line says; from then on it keeps nothing more.
 */
-static int cacheAlreadyHolds(uint64_t keyId, const char* text) {
-    if (!global_textCache || !keyId || !text) return 0;
-    uint64_t pool = 0;
-    if (!readQword(global_textCache + TEXT_CACHE_POOL, &pool) || !pool) return 0;
-    int held = 0;
-    GUARD_TRY {
-        for (int i = 0; i < TEXT_CACHE_ENTRY_MAX; ++i) {
-            const uint64_t entry = global_textCache + TEXT_CACHE_ENTRIES
-                                 + (uint64_t)i * TEXT_CACHE_ENTRY_SIZE;
-            if (*(const uint64_t*)entry != keyId) continue;
-            const int offset = *(const int*)(entry + 8);
-            if (offset < 0) break;
-            held = strcmp((const char*)(pool + (uint64_t)offset), text) == 0;
-            break;
+static int storeText(uint64_t id, const char* text) {
+    if (!id || !text || !global_textArena) return 0;
+    AcquireSRWLockExclusive(&global_textStoreLock);
+    StoredText* slot = nullptr;
+    for (uint64_t probe = 0; probe < TEXT_STORE_SLOTS && !slot; ++probe) {
+        StoredText* at =
+            &global_storedText[(id + probe) & (TEXT_STORE_SLOTS - 1)];
+        if (at->id == id || !at->id) slot = at;
+    }
+    int stored = 0;
+    if (slot && slot->id == id && strcmp(slot->text, text) == 0)
+        stored = 1;
+    else if (slot && !global_textStoreFull) {
+        const size_t length = strlen(text) + 1;
+        const int newId = !slot->id;
+        if (length <= TEXT_STORE_BYTES - global_textArenaUsed
+            && (!newId || global_storedTextCount < TEXT_STORE_MOST)) {
+            char* kept = global_textArena + global_textArenaUsed;
+            memcpy(kept, text, length);
+            global_textArenaUsed += length;
+            if (newId) {
+                slot->text = kept;
+                InterlockedExchange64((volatile LONG64*)&slot->id, (LONG64)id);
+                ++global_storedTextCount;
+            } else
+                InterlockedExchangePointer((PVOID volatile*)&slot->text, kept);
+            stored = 1;
+        } else {
+            global_textStoreFull = 1;
+            writeLog("TEXT the framework's store of texts is full, with %d "
+                     "texts in %u of its %u bytes, so from now on a "
+                     "description, a reason a control is greyed out or a "
+                     "button label that it does not hold already is not "
+                     "shown", global_storedTextCount,
+                     (unsigned)global_textArenaUsed, TEXT_STORE_BYTES);
         }
-    } GUARD_EXCEPT { held = 0; }
-    return held;
-}
-
-/* The text put in the cache under keyId, unless it is there already. */
-static void addTextToCache(uint64_t keyId, const char* text,
-                           const char* during = "putting text of ours in the "
-                                                "cache") {
-    if (!global_textCache || !global_addText || !text || !text[0]) return;
-    if (cacheAlreadyHolds(keyId, text)) return;
-    GUARD_TRY {
-        ((AddTextFn)global_addText)(global_textCache, keyId, text, 0, 0);
-    } GUARD_EXCEPT_DESCRIBING(during) { }
+    }
+    ReleaseSRWLockExclusive(&global_textStoreLock);
+    return stored;
 }
 
 /*
-    The labels go into the cache again when a page is pushed and on every tick
-    after that.
+    Where the game's text lookup ends, for one build of the game: the
+    instruction every lookup passes with its answer (in Part I, every lookup
+    but those of the two ids that stand for no text).
 
-    onPage names the page whose labels are wanted. A label belonging to another
-    page is left out. A label with no page of its own is written whatever is
-    open.
+        answeredRva       that instruction, where the hook is placed
+        answeredBytes     its bytes, answeredLength of them
+        databaseRva       the game's main text database
+        idRegister        the LOADER_REG_ number of the register that holds,
+                          at that instruction, the id looked up, wherever the
+                          answer is 0
+        databaseRegister  the same for the text database it was looked up in
+        answerRegister    the same for the answer: the text, or 0 where none
+                          was found
 */
-static void registerPageTexts(const char* onPage) {
-    if (!global_textCache || !global_addText) return;
-    for (int i = 0; i < global_pageTextCount; ++i) {
-        const PageText* p = &global_pageText[i];
-        if (!p->page[0] || (onPage && onPage[0] && !_stricmp(p->page, onPage)))
-            addTextToCache(p->id, p->text, "putting a button label in the cache");
+struct TextLookupEnd {
+    uint64_t       answeredRva;
+    const uint8_t* answeredBytes;
+    size_t         answeredLength;
+    uint64_t       databaseRva;
+    int            idRegister;
+    int            databaseRegister;
+    int            answerRegister;
+};
+
+/* tlou-i.exe 1.1.5.0: TextDb::FindText (0048E750) ends at mov rdi,[rsp+80h]
+   (0048E87C) with the id in rbx, the text database in rbp and the answer in
+   rax. The main text database is 0346B8C0. */
+static const uint8_t partOneTextAnsweredBytes[] = {
+    0x48, 0x8B, 0xBC, 0x24, 0x80, 0x00, 0x00, 0x00 };
+
+static const TextLookupEnd partOneTextLookup = {
+    0x0048E87Cull, partOneTextAnsweredBytes, sizeof(partOneTextAnsweredBytes),
+    0x0346B8C0ull, LOADER_REG_RBX, LOADER_REG_RBP, LOADER_REG_RAX };
+
+/*
+    tlou-ii.exe 1.6.0: TextDb::FindText (014AF010) ends at mov rcx,[rsp+50h]
+    (014AF2AA) with the answer in rax and the text database in rdi. Where the
+    answer is 0, rcx holds the id looked up: the key FindText made of it, the
+    id itself for every id but some of the game's own. The main text database
+    is 036B3070. tlou-ii-l.exe 1.6.0: the same, FindText 014C5E00 ending at
+    014C609A, the main text database 036EB070.
+*/
+static const uint8_t partTwoTextAnsweredBytes[] = {
+    0x48, 0x8B, 0x4C, 0x24, 0x50 };
+
+static const TextLookupEnd partTwoTextLookup = {
+    0x014AF2AAull, partTwoTextAnsweredBytes, sizeof(partTwoTextAnsweredBytes),
+    0x036B3070ull, LOADER_REG_RCX, LOADER_REG_RDI, LOADER_REG_RAX };
+
+static const TextLookupEnd partTwoLTextLookup = {
+    0x014C609Aull, partTwoTextAnsweredBytes, sizeof(partTwoTextAnsweredBytes),
+    0x036EB070ull, LOADER_REG_RCX, LOADER_REG_RDI, LOADER_REG_RAX };
+
+/* The text lookup of the build installHooks checked. */
+static const TextLookupEnd* global_textLookup = nullptr;
+
+/* The hook where the lookup ends is placed, so the store's texts are
+   answered. */
+static int global_textLookupHooked = 0;
+
+/* How many lookups were answered with a text of the store's. */
+static volatile LONG global_textAnswers = 0;
+
+/*
+    Where the game's text lookup ends. A lookup the game answered is left as
+    it is. One in the main text database that found nothing is answered with
+    the text the store holds for its id, where it holds one.
+*/
+static void textAnswered(void* registers, void*) {
+    const TextLookupEnd* place = global_textLookup;
+    if (!place || loaderHookRegister(registers, place->answerRegister)) return;
+    if (loaderHookRegister(registers, place->databaseRegister)
+        != global_moduleBase + place->databaseRva)
+        return;
+    const char* text =
+        textOfId(loaderHookRegister(registers, place->idRegister));
+    if (!text) return;
+    loaderHookSetRegister(registers, place->answerRegister,
+                          (uint64_t)(uintptr_t)text);
+    InterlockedIncrement(&global_textAnswers);
+}
+
+/* Whether the count bytes at at are the loader's jump for another plugin's
+   hook at the same place: E9 and its 32-bit displacement, then 90 for each
+   byte after the fifth. */
+static int loaderJumpOver(const uint8_t* at, size_t count) {
+    if (count < 5 || at[0] != 0xE9) return 0;
+    for (size_t i = 5; i < count; ++i)
+        if (at[i] != 0x90) return 0;
+    return 1;
+}
+
+/* The hook where the game's text lookup ends, placed where the game's bytes
+   are the ones expected, or where the loader's jump for another plugin's
+   hook stands over them. */
+static void hookTextLookup() {
+    static const char* const lost =
+        "descriptions, the reasons controls are greyed out, and the labels "
+        "of buttons that have no setting of their own are not shown";
+    const TextLookupEnd* place = global_textLookup;
+    if (!place) return;
+    const uint64_t address = global_moduleBase + place->answeredRva;
+    int expected = 0;
+    GUARD_TRY {
+        const uint8_t* at = (const uint8_t*)(uintptr_t)address;
+        expected = memcmp(at, place->answeredBytes, place->answeredLength) == 0
+                || loaderJumpOver(at, place->answeredLength);
+    } GUARD_EXCEPT_DESCRIBING("comparing the game's text lookup") {
+        expected = 0;
     }
+    if (!expected) {
+        writeLog("TEXT the game's code where its text lookup ends is not what "
+                 "the framework expects, so %s", lost);
+        return;
+    }
+    if (!loaderHookAddress("modmenu_text_answered", address, textAnswered,
+                           nullptr)) {
+        writeLog("TEXT the loader refused the hook where the game's text "
+                 "lookup ends, so %s", lost);
+        return;
+    }
+    global_textLookupHooked = 1;
 }
 
 static uint64_t global_ownVtable[MAX_FRAMEWORK_SOURCES][OWN_VTABLE_SLOTS];
@@ -6781,10 +9372,11 @@ static void ourGetFieldConfig(uint64_t source, uint64_t config, uint64_t) {
         const OurSetting* s = ourSourceByObject(source);
 
         /*
-            The byte the class keeps at +0x31, which slot 18 answers with. The
-            data source's own Init writes 1 into it for every source the engine
-            builds. The component reads it once, five slots after its own Init,
-            to decide whether to bind the source again.
+            The byte the class keeps at +0x31, which slot 18 (Part II 19)
+            answers with. The data source's own Init writes 1 into it for
+            every source the engine builds. The component reads it once, five
+            slots after its own Init, to decide whether to bind the source
+            again.
         */
         if (s && s->object) *(uint8_t*)(s->object + 0x31) = 1;
 
@@ -6802,8 +9394,10 @@ static void ourGetFieldConfig(uint64_t source, uint64_t config, uint64_t) {
         values[0]  = global_valueId;
         per[0]     = 1;
         /* A keybind's row is a button: its cell is filled by the framework
-           itself (keybindTick). */
-        if (!s || (s->kind != KIND_BUTTON && s->kind != KIND_KEYBIND)) {
+           itself (keybindTick). Where keys cannot be set it is a selector's
+           row, and text0 shows the key's name. */
+        if (!s || (s->kind != KIND_BUTTON
+                   && (s->kind != KIND_KEYBIND || keyShownOnly(s)))) {
             widgets[1] = global_textWidgetId;
             values[1]  = global_valueId;
             per[1]     = 1;
@@ -6828,12 +9422,15 @@ static void ourGetFieldConfig(uint64_t source, uint64_t config, uint64_t) {
     Reset to defaults.
 
     Every control drawn on the page being reset is put back to its
-    DefaultValue. A locked control already shows its default; for it, every
-    value it put aside is put back to its default instead, one for each setting
-    it can reach.
+    DefaultValue. For a locked control, every value it put aside is put back
+    to its default first, one for each setting it can reach. A locked control
+    that put a value aside for the setting it reads and whose settings file
+    holds its default is left as it is. Any other locked control, one that put
+    nothing aside or whose settings file holds something else, as when the
+    default could not be written when it locked, is put back to its default,
+    and its settings file written with it. A keybind whose key cannot be set
+    in this build (keyShownOnly) is left as it is.
 */
-#define RESET_PAGE_RVA        0x01C7C268ull
-
 static int settingIsAtDefault(const OurSetting* s);
 
 /*
@@ -6876,6 +9473,7 @@ static void resetEveryPutAside(OurSetting* s) {
 
 /* page is the page being reset. */
 static void resetOpenPage(uint64_t page) {
+    forgetPutAsideOfNewFiles();
     /* Which controls are locked is read before anything is put back. */
     int wasLocked[MAX_FRAMEWORK_SOURCES];
     for (int i = 0; i < global_ourSourceCount; ++i)
@@ -6884,19 +9482,23 @@ static void resetOpenPage(uint64_t page) {
 
     for (int i = 0; i < global_ourSourceCount; ++i) {
         OurSetting* s = &global_ourSources[i];
-        if (!holdsValue(s) || !rowIsOnPage(rowNow(s), page)) continue;
+        if (!holdsValue(s) || keyShownOnly(s) || !rowIsOnPage(rowNow(s), page))
+            continue;
         /* The settings this control reaches through its name but is not
            reading at the moment, whether or not it is locked. */
         resetEveryKeyOf(s);
         if (wasLocked[i] != LOCKED_BY_NOTHING) {
             resetEveryPutAside(s);
-            continue;
-        }
-        if (settingIsAtDefault(s) && s->markAsModified) continue;
+            PutAside aside;
+            readPutAside(s, s->storeKey, s->fallbackText, &aside);
+            if (aside.stored[0]
+                && presetValuesMatch(aside.held, s->fallbackText))
+                continue;
+        } else if (settingIsAtDefault(s) && s->markAsModified) continue;
         takeValue(s, s->fallbackText, 0);
         s->touched = 1;
         keepText(s->storePath, s->storeSection, s->storeKey, s->fallbackText);
-        if (s->listOwner >= 0) composeList(s->listOwner);
+        composeList(listOf(s));
     }
     settleAfterChange(0);
     for (int i = 0; i < global_ourSourceCount; ++i)
@@ -6915,13 +9517,53 @@ static void resetPageHook(void* registers, void*) {
     resetOpenPage(loaderHookRegister(registers, LOADER_REG_RCX));
 }
 
+/* Page::ResetToDefaults from its opening through its first call, in
+   tlou-i.exe 1.1.5.0 (01C7C268), then in tlou-ii.exe and tlou-ii-l.exe 1.6.0
+   (01E3D7F0 and 01E664C0, the same bytes in both). The loader's jump replaces
+   the first instruction, 5 bytes, in each. */
+static const uint8_t partOneResetPageBytes[] = {
+    0x48,0x89,0x5C,0x24,0x10, 0x48,0x89,0x74,0x24,0x18, 0x48,0x89,0x7C,0x24,0x20,
+    0x55, 0x41,0x54, 0x41,0x55, 0x41,0x56, 0x41,0x57, 0x48,0x8B,0xEC,
+    0x48,0x83,0xEC,0x50, 0x48,0x8B,0xD1, 0x4C,0x8B,0xF1, 0xE8,0x5E,0xFF,0xFF,0xFF
+};
+
+static const uint8_t partTwoResetPageBytes[] = {
+    0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x6C,0x24,0x10, 0x48,0x89,0x74,0x24,0x18,
+    0x48,0x89,0x7C,0x24,0x20, 0x41,0x56, 0x48,0x83,0xEC,0x60, 0x48,0x8B,0xD1,
+    0x4C,0x8B,0xF1, 0xE8,0x5B,0xFF,0xFF,0xFF
+};
+
+/* Whether code the framework hooks stands at its address as expected, or
+   with the loader's jump for another plugin's hook over its first
+   jumpLength bytes and the rest as expected. */
+static int hookedCodeAsExpected(const ExpectedCode& code) {
+    if (codeAsExpected(code)) return 1;
+    if (!code.rva || !code.bytes || code.jumpLength < 5
+        || code.jumpLength > code.length)
+        return 0;
+    int same = 0;
+    GUARD_TRY {
+        const uint8_t* at = (const uint8_t*)(uintptr_t)(global_moduleBase
+                                                        + code.rva);
+        same = loaderJumpOver(at, code.jumpLength)
+            && memcmp(at + code.jumpLength, code.bytes + code.jumpLength,
+                      code.length - code.jumpLength) == 0;
+    } GUARD_EXCEPT_DESCRIBING("comparing the game's code") { same = 0; }
+    return same;
+}
+
 static void watchResetButton() {
+    if (!hookedCodeAsExpected(global_game->resetPage)) {
+        writeLog("RESET the game's code that puts a page back to its defaults "
+                 "is not what the framework expects, so the reset prompt does "
+                 "nothing");
+        return;
+    }
     if (!loaderHookAddress("Page::ResetToDefaults",
-                           global_moduleBase + RESET_PAGE_RVA, resetPageHook,
-                           nullptr))
-        writeLog("RESET the loader refused the page reset at rva %08llX, so "
-                 "the reset prompt does nothing",
-                 (unsigned long long)RESET_PAGE_RVA);
+                           global_moduleBase + global_game->resetPage.rva,
+                           resetPageHook, nullptr))
+        writeLog("RESET the loader refused Page::ResetToDefaults, so the reset "
+                 "prompt does nothing");
 }
 
 /*
@@ -6930,8 +9572,11 @@ static void watchResetButton() {
     A row shows the title in label0 and the text for this item in text0, both
     plain strings, and a slider's bar takes two more values. A toggle and a
     selector take their text from the options named in the menu file; a slider
-    has no named options, so the number itself is written out.
+    has no named options, so the number itself is written out. A keybind whose
+    key cannot be set (keyShownOnly) shows its key's name as its one option.
 */
+static const char* keyNameOf(int key, char* out, size_t size);
+
 static uint64_t ourGetItemData(uint64_t source, uint64_t index,
                                uint64_t widget) {
     OurSetting* s = ourSourceByObject(source);
@@ -6948,7 +9593,8 @@ static uint64_t ourGetItemData(uint64_t source, uint64_t index,
 
     const int at = (int)(int32_t)(uint32_t)index;
     if (at < 0) return 0;
-    if (s->kind == KIND_BUTTON || s->kind == KIND_KEYBIND) {
+    if (s->kind == KIND_BUTTON
+        || (s->kind == KIND_KEYBIND && !keyShownOnly(s))) {
         if (at > 0) return 0;
         ItemData* b = &global_itemData[which][0];
         /* A keybind carries the bullet a changed setting carries. */
@@ -6964,11 +9610,17 @@ static uint64_t ourGetItemData(uint64_t source, uint64_t index,
     ItemData* d = &global_itemData[which][at % ITEMS_HELD];
     if (s->kind == KIND_SLIDER) {
         /* A value the store held that the range cannot reach is shown as it
-           stands until the control is used. */
-        if (s->mismatch && !s->touched)
-            strcpy_s(d->text, sizeof(d->text), s->shown);
-        else if (!sliderValueText(s, d->text, sizeof(d->text)))
+           stands until the control is used, and as a number where the engine
+           cannot draw it as it stands. */
+        if (s->mismatch && !s->touched) {
+            if (fatalPipeAt(s->shown) < 0 && fatalTagAt(s->shown) < 0)
+                strcpy_s(d->text, sizeof(d->text), s->shown);
+            else
+                writeNumber(d->text, sizeof(d->text), s->value);
+        } else if (!sliderValueText(s, d->text, sizeof(d->text)))
             writeNumber(d->text, sizeof(d->text), s->value);
+    } else if (s->kind == KIND_KEYBIND) {
+        keyNameOf((int)s->value, d->text, sizeof(d->text));
     } else {
         refreshOptionLabel(s, at);
         strcpy_s(d->text, sizeof(d->text), s->option[at]);
@@ -7022,6 +9674,9 @@ static void ourGetValueRange(uint64_t source, uint64_t least, uint64_t greatest,
     if (!s) return;
     refreshExpressions(s);
     presetFollow(s);
+    /* A control with no options has no range to give, and nothing is
+       written. */
+    if (s->kind != KIND_SLIDER && s->optionCount <= 0) return;
     GUARD_TRY {
         if (s->kind == KIND_SLIDER && s->logarithmic) {
             const int positions = positionsOf(s);
@@ -7077,25 +9732,26 @@ static uint64_t answerTextId(uint64_t out, uint64_t id, const char* during) {
 }
 
 /*
-    GetDescriptionTextId(StringId64* out, ...). The pane asks by id: the text is
-    put into the text cache under an id of the setting's own making, and that id
-    handed back.
+    GetDescriptionTextId(StringId64* out, ...). The pane asks by id: the text
+    is kept in the framework's store of texts under the hash of the text
+    itself, one id per wording, and that id handed back. 0, which shows no
+    description, where the store cannot answer the game with it.
 */
 static uint64_t ourGetDescriptionTextId(uint64_t source, uint64_t out,
                                         uint64_t, uint64_t) {
     OurSetting* s = ourSourceByObject(source);
     if (!s) return out;
     refreshExpressions(s);
-    if (s->description[0]) {
+    uint64_t id = 0;
+    if (s->description[0] && global_textLookupHooked) {
         char shown[MAX_SHOWN_TEXT];
         if (s->html) copyBounded(shown, sizeof(shown), s->description,
                                  "description");
         else escapeForMarkup(s->description, shown, sizeof(shown));
-        /* The id is the text's own hash: one id per wording. */
-        s->descriptionKeyId = hashText(shown);
-        addTextToCache(s->descriptionKeyId, shown);
+        id = hashText(shown);
+        if (!storeText(id, shown)) id = 0;
     }
-    return answerTextId(out, s->description[0] ? s->descriptionKeyId : 0,
+    return answerTextId(out, id,
                         "giving the description id of a setting of ours");
 }
 
@@ -7107,7 +9763,9 @@ static uint64_t ourGetDescriptionTextId(uint64_t source, uint64_t out,
 static int settingIsAtDefault(const OurSetting* s) {
     if (!s->markAsModified || s->kind == KIND_BUTTON) return 1;
     if (s->kind == KIND_SLIDER) return sameNumber(s->value, s->fallback);
-    /* A preset with no DefaultValue has no default to differ from. */
+    /* A preset with an Off is at its default while Off holds; one with no
+       DefaultValue has no default to differ from. */
+    if (s->kind == KIND_PRESET && presetOff(s)) return presetOffHolds(s);
     if (s->kind == KIND_PRESET && !s->fallbackText[0]) return 1;
     if (s->kind == KIND_KEYBIND)
         return (int)s->value == keybindKeyOf(s->fallbackText);
@@ -7116,10 +9774,13 @@ static int settingIsAtDefault(const OurSetting* s) {
     return 1;
 }
 
+/* A keybind whose key cannot be set (keyShownOnly) answers yes, since a reset
+   leaves it as it is; its title still carries the bullet where its key is
+   not its default. */
 static uint8_t ourIsAtDefault(uint64_t source, uint64_t, uint64_t) {
     OurSetting* s = ourSourceByObject(source);
     presetFollow(s);
-    return (uint8_t)(!s || settingIsAtDefault(s) ? 1 : 0);
+    return (uint8_t)(!s || keyShownOnly(s) || settingIsAtDefault(s) ? 1 : 0);
 }
 
 /*
@@ -7129,7 +9790,7 @@ static uint32_t ourGetAvailability(uint64_t source) {
     OurSetting* s = ourSourceByObject(source);
     if (!s || s->kind == KIND_BUTTON) return AVAILABLE;
     const int why = whyLocked(s);
-    if (why != s->locked) takeLockState(s, why);
+    if (why != s->locked || s->lockPutOff) takeLockState(s, why);
     return why == LOCKED_BY_NOTHING ? (uint32_t)AVAILABLE
                                     : (uint32_t)APPEARS_DISABLED;
 }
@@ -7163,20 +9824,16 @@ static uint64_t ourGetDependencyDescriptionId(uint64_t source, uint64_t out,
     const int why = whyLocked(s);
     OurSetting* says = why == LOCKED_BY_ITS_LIST ? &global_ourSources[s->gatingList]
                      : why == LOCKED_BY_ITSELF   ? s : nullptr;
-    const int say = says && says->dependencyDescription[0];
-    if (say) {
-        char shown[MAX_SHOWN_TEXT];
-        if (says->html || says->dependencyIsOurs)
-            copyBounded(shown, sizeof(shown), says->dependencyDescription,
-                        "dependency description");
-        else
-            escapeForMarkup(says->dependencyDescription, shown, sizeof(shown));
+    uint64_t id = 0;
+    if (says && says->dependencyDescription[0] && global_textLookupHooked) {
         char drawn[MAX_SHOWN_TEXT + MAX_LOCKED_MARKUP];
-        dressLockedText(shown, drawn, sizeof(drawn));
-        says->dependencyDescriptionKeyId = hashText(drawn);
-        addTextToCache(says->dependencyDescriptionKeyId, drawn);
+        lockedTextOf(says->dependencyDescription,
+                     says->html || says->dependencyIsOurs, drawn,
+                     sizeof(drawn));
+        id = hashText(drawn);
+        if (!storeText(id, drawn)) id = 0;
     }
-    return answerTextId(out, say ? says->dependencyDescriptionKeyId : 0,
+    return answerTextId(out, id,
                         "giving the dependency description id of a setting "
                         "of ours");
 }
@@ -7217,38 +9874,58 @@ static void followRowPosition(const OurSetting* s) {
 
 /*
     One setting a preset names, given value. A control takes it as if it had
-    been chosen on its row, and is drawn again; a locked control takes it as
-    the value it goes back to when it unlocks; a settings file key no control
+    been chosen on its row, and is drawn again; a settings file key no control
     reads is written as it is.
+
+    A locked control that put a value aside takes the preset's value as the
+    value it goes back to when it unlocks, where the value put aside belongs
+    to the lock or the control has a default. Where the value put aside does
+    not belong to the lock, or the settings file does not hold the default, as
+    when it could not be written when the control locked, the default is also
+    written to the settings file and noted, as a lock leaves them, and the
+    unlock then gives the preset's value back. Where the default cannot be
+    written to the settings file, the preset's value is not kept for the
+    unlock, which takes what the settings file holds. Any other locked
+    control, one that put nothing aside or one with no default whose value
+    put aside does not belong to the lock, takes the value as an unlocked
+    control does. A keybind whose key cannot be set (keyShownOnly) is left as
+    it is.
 */
 static void presetSet(const OurSetting* preset, const char* name,
                       const char* value) {
     char whole[MODPAGE_NAME * 2], section[MODPAGE_NAME];
-    copyBounded(whole, sizeof(whole), name, "a preset's setting");
+    copyBounded(whole, sizeof(whole), name, "setting name in a preset");
     const char* key = splitSettingName(whole, 1, preset, section,
-                                       sizeof(section), "a preset's section");
+                                       sizeof(section), "section in a preset");
     OurSetting* t = settingNamed(preset->storePath, section, key);
     if (!t) {
         keepText(preset->storePath, section, key, value);
         return;
     }
-    if (!holdsValue(t)) return;
+    if (!holdsValue(t) || keyShownOnly(t)) return;
     if (t->locked != LOCKED_BY_NOTHING && global_settingsCachePath[0]) {
-        CacheNames names;
-        cacheNames(t, t->storeKey, &names);
-        char stored[MAX_SETTING_TEXT];
-        storedText(global_settingsCachePath, names.section, names.storedKey, "",
-                   stored, sizeof(stored));
-        if (stored[0]) {
-            keepText(global_settingsCachePath, names.section, names.storedKey,
-                     value);
+        PutAside aside;
+        readPutAside(t, t->storeKey, t->fallbackText, &aside);
+        if (aside.stored[0] && (aside.belongs || t->fallbackText[0])) {
+            if (!keepText(global_settingsCachePath, aside.names.section,
+                          aside.names.storedKey, value)
+                || (aside.belongs
+                    && (!t->fallbackText[0]
+                        || presetValuesMatch(aside.held, t->fallbackText))))
+                return;
+            noteLeftBehind(aside.entry, 0);
+            if (writeLockedDefault(t, t->storeKey, t->fallbackText, &aside)) {
+                takeValue(t, t->fallbackText, 0);
+                composeList(listOf(t));
+                t->rangeMoved = 1;   /* its row is drawn again */
+            }
             return;
         }
     }
     takeValue(t, value, 1);
     t->touched = 1;
     keepText(t->storePath, t->storeSection, t->storeKey, value);
-    if (t->listOwner >= 0) composeList(t->listOwner);
+    composeList(listOf(t));
     followRowPosition(t);
     t->rangeMoved = 1;   /* its row is drawn again */
 }
@@ -7296,6 +9973,16 @@ static void presetPutAside(const OurSetting* s) {
     keepText(global_settingsCachePath, names.section, key, "1");
 }
 
+/* Nothing put aside: a preset chosen from Off leaves Custom nothing to put
+   back. */
+static void presetForgetAside(const OurSetting* s) {
+    if (!global_settingsCachePath[0]) return;
+    CacheNames names;
+    char key[MODPAGE_NAME * 4];
+    presetAsideKey(s, 0, &names, key, sizeof(key));
+    keepText(global_settingsCachePath, names.section, key, "");
+}
+
 /* The values put aside, put back. Nothing where none were. */
 static void presetPutBack(const OurSetting* s) {
     if (!global_settingsCachePath[0]) return;
@@ -7328,7 +10015,10 @@ static uint64_t presetChoose(OurSetting* s, int now) {
     if (now > presets) now = presets;
     if (now == s->index) return 0;
     if (now < presets) {
-        if (s->index == presets) presetPutAside(s);
+        if (s->index == presets) {
+            if (presetOffHolds(s)) presetForgetAside(s);
+            else presetPutAside(s);
+        }
         const Preset* preset = &global_preset[global_modItems[s->modItem]
                                                   .firstPreset + now];
         for (int k = 0; k < preset->count; ++k)
@@ -7358,6 +10048,9 @@ static uint64_t ourSetItemValue(uint64_t source, uint64_t value, uint64_t a2,
     OurSetting* s = ourSourceByObject(source);
     if (!s || s->kind == KIND_BUTTON || s->kind == KIND_KEYBIND) return 0;
     refreshExpressions(s);
+    /* A control with no options has no position to take, and nothing is
+       written. */
+    if (s->kind != KIND_SLIDER && s->optionCount <= 0) return 0;
     if (s->kind == KIND_PRESET)
         return presetChoose(s, (int)(int32_t)(uint32_t)value);
 
@@ -7405,13 +10098,15 @@ static uint64_t ourSetItemValue(uint64_t source, uint64_t value, uint64_t a2,
     s->unsaved = 0;
     strcpy_s(s->shown, sizeof(s->shown), keeps);
     keepText(s->storePath, s->storeSection, s->storeKey, keeps);
-    if (s->listOwner >= 0) composeList(s->listOwner);
+    composeList(listOf(s));
     followRowPosition(s);
     settleAfterChange(s);
     return 1;
 }
 
 static void giveOurSettingsOwnVtable() {
+    const GameBuild* g = global_game;
+    if (!g) return;
     for (int i = 0; i < global_ourSourceCount; ++i) {
         OurSetting* s = &global_ourSources[i];
         if (!s->object || !s->vtable) continue;
@@ -7421,29 +10116,29 @@ static void giveOurSettingsOwnVtable() {
         while (slots < OWN_VTABLE_SLOTS
                && readQword(s->vtable + 8ull * (uint64_t)slots, &copy[slots]))
             ++slots;
-        if (slots <= VALUE_POINTER_SLOT) {
+        if (slots <= g->valuePointerSlot) {
             writeLog("SETTING \"%s\": only %d vtable slot(s) could be read, so "
                      "the table was not replaced", s->name, slots);
             continue;
         }
 
         /* Where the class's own table ends. */
-        for (int at = s->kind == KIND_SLIDER ? SLIDER_VTABLE_SLOTS
-                                             : SELECTOR_VTABLE_SLOTS;
+        for (int at = s->kind == KIND_SLIDER ? g->sliderTableSlots
+                                             : g->selectorTableSlots;
              at < slots; ++at)
             copy[at] = (uint64_t)&ourUnknownSlot;
 
-        copy[SET_ITEM_VALUE_SLOT] = (uint64_t)&ourSetItemValue;
-        copy[FIELD_CONFIG_SLOT]   = (uint64_t)&ourGetFieldConfig;
-        copy[OUR_ITEM_DATA_SLOT]  = (uint64_t)&ourGetItemData;
-        copy[LABEL_SLOT]          = (uint64_t)&ourGetLabelTextId;
-        copy[DESCRIPTION_SLOT]    = (uint64_t)&ourGetDescriptionTextId;
-        copy[AT_DEFAULT_SLOT]     = (uint64_t)&ourIsAtDefault;
-        copy[AVAILABILITY_SLOT]   = (uint64_t)&ourGetAvailability;
-        copy[HIDDEN_SLOT]         = (uint64_t)&ourIsHidden;
-        copy[DEPENDENCY_TEXT_SLOT] = (uint64_t)&ourGetDependencyDescriptionId;
-        copy[VALUE_RANGE_SLOT]    = (uint64_t)&ourGetValueRange;
-        copy[VALUE_POINTER_SLOT]  = s->kind == KIND_SLIDER
+        copy[SET_ITEM_VALUE_SLOT]   = (uint64_t)&ourSetItemValue;
+        copy[FIELD_CONFIG_SLOT]     = (uint64_t)&ourGetFieldConfig;
+        copy[OUR_ITEM_DATA_SLOT]    = (uint64_t)&ourGetItemData;
+        copy[g->labelSlot]          = (uint64_t)&ourGetLabelTextId;
+        copy[g->descriptionSlot]    = (uint64_t)&ourGetDescriptionTextId;
+        copy[AT_DEFAULT_SLOT]       = (uint64_t)&ourIsAtDefault;
+        copy[g->availabilitySlot]   = (uint64_t)&ourGetAvailability;
+        copy[g->hiddenSlot]         = (uint64_t)&ourIsHidden;
+        copy[g->dependencyTextSlot] = (uint64_t)&ourGetDependencyDescriptionId;
+        copy[g->valueRangeSlot]     = (uint64_t)&ourGetValueRange;
+        copy[g->valuePointerSlot]   = s->kind == KIND_SLIDER
             ? (uint64_t)&ourGetValue : (uint64_t)&ourGetValuePtr;
 
         followRowPosition(s);
@@ -7509,44 +10204,138 @@ static void giveOurSettingsOwnVtable() {
     game binds them), and the keys the game's controls bind where the keybind
     does not allow them (by default, those bound outside its menus).
 
-    Every address here is tlou-i.exe 1.1.5.0's; on another build a keybind
-    row shows its title alone and cannot be set.
+    Every address and offset is the build's own (KeybindPlaces): tlou-i.exe
+    1.1.5.0's and tlou-ii.exe 1.6.0's, used only in a build whose keybinds is
+    1. Elsewhere a keybind's row is a selector that shows its key's name
+    (keyShownOnly), installKeybinds places no hook and keybindTick does
+    nothing. Part II differs:
+      - It fills no frame copy of the keyboard state; a key is read with
+        GetAsyncKeyState, and only while the window in front is the game's.
+      - Its send-event command (01FF4D90) does what SEND_EVENT does without
+        calling it, so both are hooked.
+      - It has no menu-root getter that leaves the root unmarked; the root is
+        resolved from its handle (menuRootRecord, menuRootId).
+      - A control scheme's keyboard map holds 24 bytes an action (its id, then
+        its primary and secondary keys in 64 bits each).
+      - The remap widgets the cell document names are under pc/.
 */
-#define KEYBIND_BUILD_STAMP      0x685BEBE1u
-#define SEND_EVENT_RVA           0x02660DA0ull  /* (component, event, ...) */
-#define FIND_CHILD_RVA           0x025482C8ull  /* (widget, name, 0) -> the widget of that name below it */
-#define PLAY_LABEL_RVA           0x0254AD24ull  /* (widget, label, ...) plays an animation label */
-#define PAGE_OF_RVA              0x0254A274ull  /* (widget) -> the page it is on */
-#define PAGE_FLAGS               0x920          /* a page's flags; bit 3: it ignores its input */
+struct KeybindPlaces {
+    uint32_t stamp;                 /* the build's time stamp */
+    uint64_t sendEvent;             /* (component, event, ...) */
+    uint64_t sendEventCommand;      /* the send-event command, 0 where it calls sendEvent */
+    uint64_t findChild;             /* (widget, name, 0) -> the widget of that name below it */
+    uint64_t playLabel;             /* (widget, label, ...) plays an animation label */
+    uint64_t pageOf;                /* (widget) -> the page it is on */
+    unsigned pageFlags;             /* a page's flags; bit 3: it ignores its input */
+    uint64_t inputOf;               /* (component) -> the input its page reads */
+    uint64_t turnCommand;           /* (input, command, as), for the next frame */
+    uint64_t asProgressBar;         /* (widget) -> it as an IProgressBar, or 0 */
+    uint64_t keyIconText;           /* writes a key's icon as text into a builder */
+    uint64_t iconBuilderType;       /* that builder's class */
+    uint64_t keyboardState;         /* the frame's copy of GetKeyboardState; 0 for none */
+    uint64_t menuObject;            /* () -> the object the menu root is; 0 for none */
+    uint64_t menuRootRecord;        /* where menuObject is 0: the root's heap record */
+    uint64_t menuRootId;            /* and its id; the object is valid where its id matches */
+    uint64_t asMenuRoot;            /* (object) -> it as the menu root, or 0 */
+    unsigned menuRootChanged;       /* byte the game's menus set after a change */
+    uint64_t playCursor;            /* (menu root, label) plays the mouse cursor's state */
+    uint64_t sfxSpawnInfo;          /* (info, sound, 0, &zero) a sound's spawn info */
+    uint64_t spawnProcess;          /* Process::SpawnProcess(info, 0) */
+    uint64_t killTree;              /* Process::KillTree(process) */
+    uint64_t processManager;        /* -> the process manager */
+    unsigned processesKillable;     /* its byte: processes may be killed now */
+    unsigned progressShowSlot;      /* (bar, shown) */
+    unsigned progressSetSlot;       /* (bar, fraction, seconds, curve, 0) */
+    uint64_t progressEase;          /* (bar, fraction, per second, curve, least seconds) */
+    uint64_t controlSchemes;        /* -> the game's control schemes */
+    uint64_t controlSchemeInUse;    /* the index of the scheme in use */
+    uint64_t controlSchemeCount;    /* how many schemes there are */
+    unsigned controlSchemeBytes;
+    unsigned schemeKeyboardMap;     /* a scheme's keyboard bindings: the entries, */
+    unsigned schemeMapCount;        /* and how many, after them */
+    unsigned schemeEntryBytes;      /* an entry: id, primary key, secondary key */
+    unsigned widgetSetPropertySlot;
+    int      remapWidgetsUnderPc;   /* the cell document's remap widgets are under pc/ */
+};
+
+static const KeybindPlaces global_partOneKeybind = {
+    0x685BEBE1u,
+    0x02660DA0ull, 0,
+    0x025482C8ull, 0x0254AD24ull, 0x0254A274ull, 0x920,
+    0x02662094ull, 0x0202DC00ull, 0x025FEB64ull,
+    0x020E0EE4ull, 0x02C79208ull,
+    0x07FE7E00ull,
+    0x023712A4ull, 0, 0,
+    0x01C8A3B8ull, 0x7D0, 0x01C93978ull,
+    0x024FEBC4ull, 0x01FB367Cull, 0x01EF9270ull, 0x06433198ull, 0x60,
+    0x318, 0x3F8, 0x025FF9B8ull,
+    0x080DE940ull, 0x080DE948ull, 0x080DE94Cull, 5000, 0xD10, 0x10, 16,
+    0x380,
+    0
+};
+
+static const KeybindPlaces global_partTwoKeybind = {
+    0x687DF976u,
+    0x01FF5340ull, 0x01FF4D90ull,
+    0x01E51810ull, 0x01E55680ull, 0x01FF6E10ull, 0x8A0,
+    0x01FF6BA0ull, 0x015920C0ull, 0x01F5D870ull,
+    0x016C37F0ull, 0x02AFB4E8ull,
+    0,
+    0, 0x092D89B8ull, 0x092D89C0ull,
+    0x00FEABC0ull, 0x750, 0x00FF5A00ull,
+    0x01DD72C0ull, 0x014CD790ull, 0x013414C0ull, 0x04250C48ull, 0x40,
+    0x2E8, 0x3C8, 0x01F5E860ull,
+    0x08F1EF30ull, 0x08F1EF38ull, 0x08F1EF3Cull, 0x2378, 0x13C8, 0x10, 24,
+    0x350,
+    1
+};
+
+/* The places of the build the framework runs in; Part I's where it has
+   none, which only a build whose keybinds is 0 can be, and such a build
+   never uses them. */
+static const KeybindPlaces* keybindPlaces() {
+    if (global_game && global_game->stamp == global_partTwoKeybind.stamp)
+        return &global_partTwoKeybind;
+    return &global_partOneKeybind;
+}
+
+/* The cell document's remap widgets are under pc/ in this build. */
+static int keybindRemapWidgetsUnderPc() {
+    return keybindPlaces()->remapWidgetsUnderPc;
+}
+
+#define SEND_EVENT_RVA           (keybindPlaces()->sendEvent)
+#define FIND_CHILD_RVA           (keybindPlaces()->findChild)
+#define PLAY_LABEL_RVA           (keybindPlaces()->playLabel)
+#define PAGE_OF_RVA              (keybindPlaces()->pageOf)
+#define PAGE_FLAGS               (keybindPlaces()->pageFlags)
 #define PAGE_IGNORES_INPUT       0x08
-#define INPUT_OF_RVA             0x02662094ull  /* (component) -> the input its page reads */
-#define TURN_COMMAND_RVA         0x0202DC00ull  /* (input, command, as), for the next frame */
-#define AS_PROGRESS_BAR_RVA      0x025FEB64ull  /* (widget) -> it as an IProgressBar, or 0 */
-#define KEY_ICON_TEXT_RVA        0x020E0EE4ull  /* writes a key's icon as text into a builder */
-#define ICON_BUILDER_TYPE_RVA    0x02C79208ull  /* that builder's class */
-#define KEYBOARD_STATE_RVA       0x07FE7E00ull  /* the frame's copy of GetKeyboardState */
-#define MENU_OBJECT_RVA          0x023712A4ull  /* () -> the object the menu root is */
-#define AS_MENU_ROOT_RVA         0x01C8A3B8ull  /* (object) -> it as Menu2::RootGame, or 0 */
-#define MENU_ROOT_CHANGED        0x7D0          /* byte the game's menus set after a change */
-#define PLAY_CURSOR_RVA          0x01C93978ull  /* (menu root, label) plays the mouse cursor's state */
-#define SFX_SPAWN_INFO_RVA       0x024FEBC4ull  /* (info, sound, 0, &zero) a sound's spawn info */
-#define SPAWN_PROCESS_RVA        0x01FB367Cull  /* Process::SpawnProcess(info, 0) */
-#define KILL_TREE_RVA            0x01EF9270ull  /* Process::KillTree(process) */
-#define PROCESS_MANAGER_RVA      0x06433198ull  /* -> the process manager */
-#define PROCESSES_KILLABLE       0x60           /* its byte: processes may be killed now */
-#define SFX_SPAWN_INFO_BYTES     0x320
-#define PROGRESS_SHOW_SLOT       0x318          /* (bar, shown) */
-#define PROGRESS_SET_SLOT        0x3F8          /* (bar, fraction, seconds, curve, 0) */
-#define PROGRESS_EASE_RVA        0x025FF9B8ull  /* (bar, fraction, per second, curve, least seconds) */
+#define INPUT_OF_RVA             (keybindPlaces()->inputOf)
+#define TURN_COMMAND_RVA         (keybindPlaces()->turnCommand)
+#define AS_PROGRESS_BAR_RVA      (keybindPlaces()->asProgressBar)
+#define KEY_ICON_TEXT_RVA        (keybindPlaces()->keyIconText)
+#define ICON_BUILDER_TYPE_RVA    (keybindPlaces()->iconBuilderType)
+#define AS_MENU_ROOT_RVA         (keybindPlaces()->asMenuRoot)
+#define MENU_ROOT_CHANGED        (keybindPlaces()->menuRootChanged)
+#define PLAY_CURSOR_RVA          (keybindPlaces()->playCursor)
+#define SFX_SPAWN_INFO_RVA       (keybindPlaces()->sfxSpawnInfo)
+#define SPAWN_PROCESS_RVA        (keybindPlaces()->spawnProcess)
+#define KILL_TREE_RVA            (keybindPlaces()->killTree)
+#define PROCESS_MANAGER_RVA      (keybindPlaces()->processManager)
+#define PROCESSES_KILLABLE       (keybindPlaces()->processesKillable)
+#define SFX_SPAWN_INFO_BYTES     0x400  /* Part I's info is 0x320, Part II's at most 0x320 */
+#define PROGRESS_SHOW_SLOT       (keybindPlaces()->progressShowSlot)
+#define PROGRESS_SET_SLOT        (keybindPlaces()->progressSetSlot)
+#define PROGRESS_EASE_RVA        (keybindPlaces()->progressEase)
 #define PROGRESS_CURVE           0x0C           /* the curve the game's page fills its bar by */
-#define CONTROL_SCHEMES_RVA      0x080DE940ull  /* -> the game's control schemes */
-#define CONTROL_SCHEME_IN_USE_RVA 0x080DE948ull /* the index of the scheme in use */
-#define CONTROL_SCHEME_COUNT_RVA 0x080DE94Cull  /* how many schemes there are */
-#define CONTROL_SCHEME_BYTES     5000
-#define SCHEME_KEYBOARD_MAP      0xD10          /* a scheme's keyboard bindings: the entries, */
-#define SCHEME_MAP_COUNT         0x10           /* and how many, after them */
+#define CONTROL_SCHEMES_RVA      (keybindPlaces()->controlSchemes)
+#define CONTROL_SCHEME_IN_USE_RVA (keybindPlaces()->controlSchemeInUse)
+#define CONTROL_SCHEME_COUNT_RVA (keybindPlaces()->controlSchemeCount)
+#define CONTROL_SCHEME_BYTES     (keybindPlaces()->controlSchemeBytes)
+#define SCHEME_KEYBOARD_MAP      (keybindPlaces()->schemeKeyboardMap)
+#define SCHEME_MAP_COUNT         (keybindPlaces()->schemeMapCount)
 #define SCHEME_MAP_MOST          4096
-#define WIDGET_SET_PROPERTY_SLOT 0x380
+#define WIDGET_SET_PROPERTY_SLOT (keybindPlaces()->widgetSetPropertySlot)
 #define BOXED_BOOL_TYPE          1
 #define KEYBIND_HOLD_SECONDS     0.3
 #define KEYBIND_FILL_SECONDS     1.5
@@ -7679,7 +10468,7 @@ struct KeybindWait {
     uint8_t   ignored[32];
 };
 
-static int           global_keybindsKnown = 0;   /* the build the addresses are for */
+static int           global_keybindsKnown = 0;   /* the hook on a row's event is in */
 static volatile LONG global_keybindAsked = -1;   /* a keybind chosen on its row */
 static KeybindWait   global_keybindWait = { -1, 0, 0, 0, 0, 0, 0, 0, { 0 } };
 static int           global_keybindCursor = 0;   /* the cursor shows the keyboard for us */
@@ -7690,9 +10479,16 @@ static char          global_keyNameText[256][24];  /* each key's name, kept aliv
 static int keyHeldNow(int key) {
     unsigned char state = 0;
     if (key <= 0 || key > 0xFF) return 0;
+    if (!keybindPlaces()->keyboardState) {
+        HWND front = GetForegroundWindow();
+        DWORD process = 0;
+        if (front) GetWindowThreadProcessId(front, &process);
+        return process == GetCurrentProcessId()
+            && (GetAsyncKeyState(key) & 0x8000) != 0;
+    }
     GUARD_TRY {
         state = *(const volatile unsigned char*)(global_moduleBase
-                                                 + KEYBOARD_STATE_RVA
+                                                 + keybindPlaces()->keyboardState
                                                  + (uint64_t)key);
     } GUARD_EXCEPT { state = 0; }
     return (state & 0x80) != 0;
@@ -7742,8 +10538,17 @@ static void keybindSetShown(uint64_t part, int shown) {
 
 /* The object the menu root is, and it as the menu root, or 0. */
 static uint64_t menuObject(void) {
+    const KeybindPlaces* k = keybindPlaces();
     uint64_t object = 0;
-    GUARD_TRY { object = ((MenuObjectFn)(global_moduleBase + MENU_OBJECT_RVA))(); }
+    if (!k->menuObject) {
+        uint64_t record = 0;
+        uint32_t id = 0;
+        if (!readQword(global_moduleBase + k->menuRootRecord, &record)
+            || !readDword(global_moduleBase + k->menuRootId, &id))
+            return 0;
+        return widgetOfHandle(record, id);
+    }
+    GUARD_TRY { object = ((MenuObjectFn)(global_moduleBase + k->menuObject))(); }
     GUARD_EXCEPT_DESCRIBING("asking for the menu root") { object = 0; }
     return object;
 }
@@ -7878,8 +10683,8 @@ static void keybindPageIgnoresInput(uint64_t row) {
     w->pageId = 0;
     if (!isPointer(page)) return;
     GUARD_TRY {
-        w->pageRecord = *(volatile uint64_t*)(page + ROW_RECORD);
-        w->pageId = *(volatile uint32_t*)(page + ROW_ID);
+        w->pageRecord = *(volatile uint64_t*)(page + global_game->rowRecord);
+        w->pageId = *(volatile uint32_t*)(page + global_game->rowId);
     } GUARD_EXCEPT { w->pageRecord = 0; w->pageId = 0; }
     keybindPageFlag(page, 1);
 }
@@ -8022,13 +10827,18 @@ static int keybindBoundInGame(const OurSetting* s, int key) {
         || !isPointer(entries))
         return 0;
     if (count > SCHEME_MAP_MOST) count = SCHEME_MAP_MOST;
+    const uint64_t stride = keybindPlaces()->schemeEntryBytes;
     for (uint64_t i = 0; i < count; ++i) {
-        uint64_t action = 0, keys = 0;
-        if (!readQword(entries + 16ull * i, &action)
-            || !readQword(entries + 16ull * i + 8, &keys))
+        uint64_t action = 0, keys = 0, second = 0;
+        if (!readQword(entries + stride * i, &action)
+            || !readQword(entries + stride * i + 8, &keys))
+            return 0;
+        if (stride == 24 && !readQword(entries + stride * i + 16, &second))
             return 0;
         if (!action || action == ~0ull) continue;
-        const uint32_t primary = (uint32_t)keys, secondary = (uint32_t)(keys >> 32);
+        const uint32_t primary = (uint32_t)keys;
+        const uint32_t secondary = stride == 24 ? (uint32_t)second
+                                                : (uint32_t)(keys >> 32);
         if (primary != code && secondary != code && primary != other
             && secondary != other)
             continue;
@@ -8168,8 +10978,11 @@ static void keybindWaitForKey(OurSetting* s, uint64_t row) {
             const uint64_t sound = keybindSound("sfx-menu-new-button-assign-hold");
             uint64_t record = 0;
             uint32_t id = 0;
-            if (isPointer(sound) && readQword(sound + ROW_RECORD, &record)) {
-                GUARD_TRY { id = *(volatile uint32_t*)(sound + ROW_ID); }
+            if (isPointer(sound)
+                && readQword(sound + global_game->rowRecord, &record)) {
+                GUARD_TRY {
+                    id = *(volatile uint32_t*)(sound + global_game->rowId);
+                }
                 GUARD_EXCEPT { id = 0; }
                 w->holdSoundRecord = record;
                 w->holdSoundId = id;
@@ -8258,25 +11071,27 @@ static void sendEventHook(void* registers, void*) {
     InterlockedExchange(&global_keybindAsked, (LONG)(s - global_ourSources));
 }
 
-/* The hook a keybind's row needs, where a menupage has one and the game is
-   the build the addresses are for. */
+/* The hook a keybind's row needs, where a menupage has one, in a build whose
+   keybinds is 1. Its address is that build's. */
 static void installKeybinds() {
+    if (!keybindsCanBeSet()) return;
     int any = 0;
     for (int i = 0; i < global_ourSourceCount && !any; ++i)
         any = global_ourSources[i].kind == KIND_KEYBIND;
     if (!any) return;
-    if (loaderGameTimeDateStamp() != KEYBIND_BUILD_STAMP) {
-        writeLog("KEYBIND the game is not tlou-i.exe 1.1.5.0, whose addresses "
-                 "the keybind control uses, so a keybind's row shows its title "
-                 "alone and cannot be set");
-        return;
-    }
     if (!loaderHookAddress("modmenu_send_event", global_moduleBase + SEND_EVENT_RVA,
                            sendEventHook, nullptr)) {
         writeLog("KEYBIND the loader refused the hook on the event a row sends, "
                  "so no keybind can be set");
         return;
     }
+    const uint64_t command = keybindPlaces()->sendEventCommand;
+    if (command
+        && !loaderHookAddress("modmenu_send_event_command",
+                              global_moduleBase + command, sendEventHook,
+                              nullptr))
+        writeLog("KEYBIND the loader refused the hook on the send-event "
+                 "command, so a keybind row chosen through it is not seen");
     global_keybindsKnown = 1;
 }
 
@@ -8295,7 +11110,7 @@ static void iniText(const char* key, const char* fallback, char* out,
 /* Everything the framework reads for itself. A page's own values live in the
    settings file that page names, not here. */
 static void readSettings() {
-    iniText("rowPositionSetting", "", global_rowPositionSetting,
+    iniText("rowPositionSetting", "menuPosition", global_rowPositionSetting,
             sizeof(global_rowPositionSetting));
     global_menuRowPosition = iniNumber("settings", "rowPosition", -1);
     iniText("lockedTextColour", "t2-red", global_lockedTextColour,
@@ -8303,64 +11118,184 @@ static void readSettings() {
     global_lockedTextBreaks = iniNumber("settings", "lockedTextBreaks", 2);
     global_lockedTextBold = iniNumber("settings", "lockedTextBold", 0);
 
-    global_maxFrameworkSources = iniNumber("dataSources", "maxFrameworkSources", 6);
+    global_maxFrameworkSources = iniNumber("dataSources", "maxFrameworkSources",
+                                           512);
     if (global_maxFrameworkSources < 0) global_maxFrameworkSources = 0;
-    global_extraSourceSlots = iniNumber("dataSources", "extraSourceSlots", 0);
+    global_extraSourceSlots = iniNumber("dataSources", "extraSourceSlots", 512);
     if (global_extraSourceSlots < 0) global_extraSourceSlots = 0;
     if (global_extraSourceSlots > 4096) global_extraSourceSlots = 4096;
 }
 
 /*
-    The text cache, through the two addresses the ini gives: textDbRva names the
-    database, whose second word is the cache, and addTextRva names Add. Both are
-    build specific.
+    The builds the framework has addresses for, by their time stamps.
+
+    A class table's length runs to where the next table begins, the address
+    the next class's constructor loads: in Part I the slider's table begins at
+    02E83ED8 and the selector's at 02E83FF0, the next at 02E840E8; in
+    tlou-ii.exe the selector's at 02F4CB68, the next at 02F4CC68, and the
+    slider's at 02F4CD88, the next at 02F4CEB8. Words copied past them are the
+    next class's methods and are replaced.
 */
-static void findTextCache() {
-    const unsigned textDb = (unsigned)iniNumber("settings", "textDbRva", 0);
-    const unsigned addText = (unsigned)iniNumber("settings", "addTextRva", 0);
-    uint64_t cache = 0;
-    if (textDb && addText && global_moduleBase
-        && readQword(global_moduleBase + textDb + 8, &cache)
-        && cache >= SMALLEST_POINTER) {
-        global_textCache = cache;
-        global_addText   = global_moduleBase + addText;
-    }
-}
+static const GameBuild partOneBuild = {
+    0x685BEBE1u, "tlou-i.exe 1.1.5.0",
+    { 0x02661C00ull, partOneAsComponentBytes,
+      sizeof(partOneAsComponentBytes) },
+    { 0x01EF8BCCull, partOneParentWidgetBytes,
+      sizeof(partOneParentWidgetBytes) },
+    { 0x011B3F10ull, partOneHandleResolveBytes,
+      sizeof(partOneHandleResolveBytes) },
+    { 0x02549FC0ull, partOneFirstChildWidgetBytes,
+      sizeof(partOneFirstChildWidgetBytes) },
+    { 0, nullptr, 0 },
+    { 0x0266275Cull, partOneHasFocusBytes, sizeof(partOneHasFocusBytes) },
+    { 0x02661028ull, partOneComponentEventBytes,
+      sizeof(partOneComponentEventBytes) },
+    { 0x01C7C268ull, partOneResetPageBytes, sizeof(partOneResetPageBytes), 5 },
+    0x0368BBC8ull,
+    &partOneTextLookup,
+    0x70, 0x98, 0x10,
+    0x350, 0x358,
+    20, 21, 24, 25, 26, 28, 30,
+    35, 31,
+    6,
+    1
+};
+
+static const GameBuild partTwoBuild = {
+    0x687DF976u, "tlou-ii.exe 1.6.0",
+    { 0x01FF6540ull, partTwoAsComponentBytes,
+      sizeof(partTwoAsComponentBytes) },
+    { 0x01340BF0ull, partTwoParentWidgetBytes,
+      sizeof(partTwoParentWidgetBytes) },
+    { 0x003383E0ull, partTwoHandleResolveBytes,
+      sizeof(partTwoHandleResolveBytes) },
+    { 0x01E544E0ull, partTwoFirstChildWidgetBytes,
+      sizeof(partTwoFirstChildWidgetBytes) },
+    { 0x01B3E830ull, partTwoFocusHolderBytes, sizeof(partTwoFocusHolderBytes) },
+    { 0x01FF7500ull, partTwoHasFocusBytes, sizeof(partTwoHasFocusBytes) },
+    { 0x01FF57E0ull, partTwoComponentEventBytes,
+      sizeof(partTwoComponentEventBytes) },
+    { 0x01E3D7F0ull, partTwoResetPageBytes, sizeof(partTwoResetPageBytes), 5 },
+    0x0949FD68ull,
+    &partTwoTextLookup,
+    0x80, 0x94, 0x0C,
+    0x320, 0x328,
+    21, 22, 25, 26, 27, 29, 31,
+    38, 32,
+    0,
+    1
+};
+
+static const GameBuild partTwoLBuild = {
+    0x687DFAA4u, "tlou-ii-l.exe 1.6.0",
+    { 0x02025710ull, partTwoLAsComponentBytes,
+      sizeof(partTwoLAsComponentBytes) },
+    { 0x013549E0ull, partTwoParentWidgetBytes,
+      sizeof(partTwoParentWidgetBytes) },
+    { 0x002A7D40ull, partTwoHandleResolveBytes,
+      sizeof(partTwoHandleResolveBytes) },
+    { 0x01E7D200ull, partTwoLFirstChildWidgetBytes,
+      sizeof(partTwoLFirstChildWidgetBytes) },
+    { 0x01B5FDE0ull, partTwoFocusHolderBytes, sizeof(partTwoFocusHolderBytes) },
+    { 0x02026700ull, partTwoLHasFocusBytes, sizeof(partTwoLHasFocusBytes) },
+    { 0x02024990ull, partTwoLComponentEventBytes,
+      sizeof(partTwoLComponentEventBytes) },
+    { 0x01E664C0ull, partTwoResetPageBytes, sizeof(partTwoResetPageBytes), 5 },
+    0x094D7D68ull,
+    &partTwoLTextLookup,
+    0x80, 0x94, 0x0C,
+    0x320, 0x328,
+    21, 22, 25, 26, 27, 29, 31,
+    38, 32,
+    0,
+    0
+};
+
+/* The builds the framework works in. */
+static const GameBuild* const knownBuilds[] = {
+    &partOneBuild, &partTwoBuild
+};
 
 /*
-    findTextCache reads a game global the game fills only when it loads its text
-    database, which it does a little after the executable is decrypted - after
-    the framework has started, when the loader runs early. So the cache is found
-    and enlarged again on each tick until it is there, then left alone. A cap
-    stops a game that never loads it from retrying forever, and logs once.
+    The builds the framework has a table for but has not been tested in: in
+    these it does nothing, with one line. The list ends with nullptr, which
+    stays when the list is otherwise empty. partTwoLBuild (tlou-ii-l.exe) is
+    kept here, unused, until it has been tested: moving &partTwoLBuild from
+    here into knownBuilds is the one change that switches it on.
 */
-#define TEXT_CACHE_MAX_TRIES 600
+static const GameBuild* const untestedBuilds[] = {
+    &partTwoLBuild, nullptr
+};
 
-static int global_textCacheTries = 0;
+/* The build whose time stamp is stamp, or nullptr. */
+static const GameBuild* gameBuildOf(uint32_t stamp) {
+    for (const GameBuild* build : knownBuilds)
+        if (build->stamp == stamp) return build;
+    return nullptr;
+}
 
-static void ensureTextCache(void) {
-    if (global_textCache) return;
-    if (global_textCacheTries < 0) return;
-    findTextCache();
-    if (global_textCache) {
-        enlargeTextPool();
+/* The untested build whose time stamp is stamp, or nullptr. */
+static const GameBuild* untestedBuildOf(uint32_t stamp) {
+    for (const GameBuild* const* build = untestedBuilds; *build; ++build)
+        if ((*build)->stamp == stamp) return *build;
+    return nullptr;
+}
+
+/* The date and the time a time stamp names, written into out as
+   YYYY-MM-DD HH:MM:SS UTC. The stamp counts seconds from the start of
+   1970-01-01, UTC. */
+static void writeStampDate(char* out, size_t room, uint32_t stamp) {
+    const __time64_t seconds = stamp;
+    struct tm when;
+    if (_gmtime64_s(&when, &seconds) != 0) {
+        formatInto(out, room, "an unknown date");
         return;
     }
-    if (++global_textCacheTries >= TEXT_CACHE_MAX_TRIES) {
-        writeLog("TEXT the text cache was not found from textDbRva and "
-                 "addTextRva after %d update(s), so a button that opens a page "
-                 "shows the text its widget was authored with",
-                 TEXT_CACHE_MAX_TRIES);
-        global_textCacheTries = -1;
-    }
+    formatInto(out, room, "%04d-%02d-%02d %02d:%02d:%02d UTC",
+               when.tm_year + 1900, when.tm_mon + 1, when.tm_mday,
+               when.tm_hour, when.tm_min, when.tm_sec);
 }
 
 /*
-    Everything the framework does, in the order it has to be done in. The pages
-    are read, the controls made from them and the widget files generated before
-    the reader and the registrar are hooked.
+    Everything the framework does, in the order it has to be done in. The build
+    is checked first. On a build it has no addresses for or has not been tested
+    in, or where the loader cannot say which build the game is (it gives no
+    time stamp, or a stamp of 0), no page is read, the settings file is neither
+    written nor read, and nothing in the game is hooked, written or called. The
+    settings file is written or completed before it is read. The pages are
+    read, the controls made from them and the widget files generated before the
+    reader and the registrar are hooked.
 */
 static void installHooks() {
+    const uint32_t stamp = loaderResolved("LoaderGameTimeDateStamp")
+                         ? loaderGameTimeDateStamp() : 0;
+    if (!stamp) {
+        writeLog("HOOK the loader does not give the game's time stamp, so the "
+                 "game's build cannot be checked and the framework does "
+                 "nothing");
+        return;
+    }
+    const GameBuild* game = gameBuildOf(stamp);
+    const GameBuild* untested = game ? nullptr : untestedBuildOf(stamp);
+    if (untested) {
+        writeLog("HOOK the framework has not been tested with %s yet, so it "
+                 "does nothing there", untested->name);
+        return;
+    }
+    if (!game) {
+        char built[40], known[160] = "";
+        writeStampDate(built, sizeof(built), stamp);
+        const size_t count = sizeof(knownBuilds) / sizeof(knownBuilds[0]);
+        for (size_t i = 0; i < count; ++i) {
+            if (i)
+                strcat_s(known, sizeof(known), i + 1 < count ? ", " : " and ");
+            strcat_s(known, sizeof(known), knownBuilds[i]->name);
+        }
+        writeLog("HOOK the game was built on %s, which is not a build the "
+                 "framework has addresses for (%s), so the framework does "
+                 "nothing", built, known);
+        return;
+    }
     global_moduleBase = (uint64_t)GetModuleHandleW(nullptr);
     global_textBase = loaderGameTextBase();
     global_textSize = loaderGameTextSize();
@@ -8370,12 +11305,16 @@ static void installHooks() {
         return;
     }
 
+    global_game = game;
+    global_textLookup = game->textLookup;
+
+    noteNewSettingsFile(global_iniPath);
+    writeDefaultSettings((HMODULE)&__ImageBase, global_iniPath);
     readSettings();
     checkRowLayout();
-    checkTopPage();
     checkFocusCalls();
-    findTextCache();
-    enlargeTextPool();
+    openTextStore();
+    hookTextLookup();
 
     global_labelWidgetId = hashText("label0");
     global_textWidgetId  = hashText("text0");
@@ -8411,15 +11350,18 @@ static void installHooks() {
                      "page of our own is added");
     }
 
-    if (!loaderHookFunction("Menu2::PageStack::PushPage", pushPageSignature,
-                            pushPageHook, nullptr))
-        writeLog("HOOK the loader refused Menu2::PageStack::PushPage, so no "
-                 "button label will be written into the text cache");
     if (!loaderHookFunction("ScriptManager::ListenerUpdate",
                             listenerUpdateSignature, listenerUpdateHook,
                             nullptr))
-        writeLog("HOOK the loader refused ScriptManager::ListenerUpdate, so a "
-                 "button label lost to the text cache turning over stays lost");
+        writeLog("HOOK the loader refused ScriptManager::ListenerUpdate, so %s"
+                 "the values put aside for a settings file its mod writes "
+                 "after the framework starts are kept unless the mod has "
+                 "written it by the first time a row is drawn, a setting "
+                 "changed, a page reset or a preset chosen",
+                 keybindsCanBeSet()
+                     ? "no keybind's cell shows its key and no keybind can be "
+                       "set, and "
+                     : "");
 
     if (loaderHookFunction(CREATE_DATA_SOURCE, createDataSourceSignature,
                            createDataSourceHook, nullptr))
@@ -8450,12 +11392,8 @@ BOOL APIENTRY DllMain(HMODULE self, DWORD reason, LPVOID) {
     slash = strrchr(global_modsDirectory, '\\');
     if (slash) *slash = 0;
 
-    char folder[MAX_PATH];
-    if (formatInto(folder, sizeof(folder), "%s\\Logs", global_directory)) {
-        CreateDirectoryA(folder, nullptr);
-        formatInto(global_logPath, sizeof(global_logPath), "%s\\%s.log",
-                   folder, pluginBaseName);
-    }
+    formatInto(global_logPath, sizeof(global_logPath), "%s\\%s.log",
+               global_directory, pluginBaseName);
     formatInto(global_iniPath, sizeof(global_iniPath), "%s\\%s.ini",
                global_directory, pluginBaseName);
     return TRUE;
@@ -8503,12 +11441,14 @@ extern "C" TLOU_PLUGIN_EXPORT int ModMenuDescribeControl(int at, char* out,
         sprintf_s(more, ", it offers %d preset(s), and shows the last option "
                         "while none matches", s->optionCount - 1);
     else if (s->kind == KIND_KEYBIND)
-        sprintf_s(more, ", it is a keybind%s", global_keybindWait.setting == at
-                                                ? " waiting for a key" : "");
+        sprintf_s(more, ", it is a keybind%s",
+                  keyShownOnly(s) ? " whose row only shows its key"
+                  : global_keybindWait.setting == at ? " waiting for a key"
+                  : "");
     if (s->hidden) strcat_s(more, sizeof(more), ", and it is hidden");
     char line[MAX_SETTING_TEXT * 6 + 480];
     sprintf_s(line, "\"%s\" reads %s in [%s], %s; the store held \"%s\", it "
-                   "shows \"%s\", its default is \"%s\"%s%s%s%s",
+                   "shows \"%s\", its default is \"%s\"%s%s%s%s%s",
               s->name,
               s->storeKey[0] ? s->storeKey : "(no key)",
               s->storeSection[0] ? s->storeSection : "(no section)",
@@ -8521,8 +11461,10 @@ extern "C" TLOU_PLUGIN_EXPORT int ModMenuDescribeControl(int at, char* out,
               s->mismatch ? ", and that value is one it cannot show" : "",
               s->hadNoRow ? ", and it was asked to draw itself again with no "
                             "row to draw in" : "",
-              rowNow(s) ? "" : ", and it has no row at the moment");
-    copyBounded(out, room, line, "a control description");
+              rowNow(s) ? "" : ", and it has no row at the moment",
+              s->onNoPage ? ", and no page draws its row, so it has no data "
+                            "source" : "");
+    copyBounded(out, room, line, "description of a control");
     return 1;
 }
 
@@ -8537,27 +11479,41 @@ extern "C" TLOU_PLUGIN_EXPORT unsigned ModMenuControlChanges(void) {
     return (unsigned)global_controlChanges;
 }
 
+/* 1 where the framework's store of texts holds a text for id, which the
+   game's text lookup is then answered with, and 0 where it does not. */
+extern "C" TLOU_PLUGIN_EXPORT int ModMenuOwnsText(uint64_t id) {
+    return textOfId(id) != nullptr;
+}
+
+/* Counts up every time the game's text lookup is answered with a text of the
+   framework's. */
+extern "C" TLOU_PLUGIN_EXPORT unsigned ModMenuTextAnswers(void) {
+    return (unsigned)global_textAnswers;
+}
+
 extern "C" TLOU_PLUGIN_EXPORT const char* PluginName(void)    { return "Mod Menu Framework"; }
-extern "C" TLOU_PLUGIN_EXPORT const char* PluginVersion(void) { return "v1.1.0"; }
+extern "C" TLOU_PLUGIN_EXPORT const char* PluginVersion(void) { return "v1.2.0"; }
 extern "C" TLOU_PLUGIN_EXPORT const char* PluginAuthor(void)  { return "mwith77"; }
 
+/* Answers 1 on every game. installHooks checks the build, and on another one
+   logs it and does nothing. */
 extern "C" TLOU_PLUGIN_EXPORT int SupportsGame(LoaderHandle) { return 1; }
 
 extern "C" TLOU_PLUGIN_EXPORT int Init(LoaderHandle loader) {
     loaderBind(loader);
     /* Before anything else: reports a bounded call handed too much. */
     loaderWatchBadArguments(PluginName());
-    const char* logs = loaderLogsFolder();
     const char* config = loaderConfigFolder();
-    if (logs && *logs)
-        formatInto(global_logPath, sizeof(global_logPath), "%s\\%s.log", logs,
+    if (config && *config)
+        formatInto(global_logPath, sizeof(global_logPath), "%s\\%s.log", config,
                    pluginBaseName);
     if (config && *config)
         formatInto(global_iniPath, sizeof(global_iniPath), "%s\\%s.ini", config,
                    pluginBaseName);
     buildSettingsCachePath();
 
-    emptyLog();
+    global_starting = 1;
     installHooks();
+    global_starting = 0;
     return 1;
 }

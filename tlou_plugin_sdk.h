@@ -232,11 +232,14 @@ static inline void loaderLog(const char* plugin, const char* fmt, ...)
     for the mod whose Init is running: read them in Init and keep a copy of
     the strings.
 
-        loaderModFolder     Mods\<mod>, where the mod's ini lives
-        loaderLogsFolder    Mods\<mod>\Logs
-        loaderCacheFolder   Mods\<mod>\Cache
+        loaderModFolder     Mods\<mod>, where the mod's ini, log and any
+                            cache live
+        loaderLogsFolder    the same folder (Mods\<mod>\Logs before loader
+                            v1.1.0_beta_4)
+        loaderCacheFolder   the same folder (Mods\<mod>\Cache before loader
+                            v1.1.0_beta_4)
 
-    Logs and Cache exist before Init is called.
+    The loader makes no folder inside a mod's folder.
 */
 static inline const char* loaderModFolder(void)
 {

@@ -1,11 +1,15 @@
 @echo off
-rem Build mod_menu_framework.dll.
-rem Run from "x64 Native Tools Command Prompt for VS".
+setlocal
+rem Build mod_menu_framework.dll. Run from the "x64 Native Tools Command Prompt for VS".
+
+rem Work in this script's own folder, wherever the prompt is.
+cd /d "%~dp0"
 
 where cl.exe >nul 2>nul || (echo cl.exe not found - use the x64 Native Tools prompt & exit /b 1)
 where rc.exe >nul 2>nul || (echo rc.exe not found & exit /b 1)
 
-rem The version resource, so the DLL carries its author, product and version.
+rem The resources: the version (author, product and version) and the default
+rem settings, mod_menu_framework.ini byte for byte.
 rc /nologo /fo mod_menu_framework.res mod_menu_framework.rc
 if errorlevel 1 (echo RC FAILED & exit /b 1)
 
@@ -21,3 +25,4 @@ del /q mod_menu_framework.obj mod_menu_framework.exp mod_menu_framework.lib ^
 
 echo.
 echo Built mod_menu_framework.dll
+exit /b 0
